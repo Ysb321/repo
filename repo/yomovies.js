@@ -20,7 +20,7 @@ export default class extends Extension {
 
     for (const element of bsxList) {
       const html = await element.content;
-
+  
       const url = await this.getAttributeText(html, "a", "href");
       const title = await this.querySelector(html, "div.qtip-title").text;
       const cover = await this
@@ -63,26 +63,14 @@ export default class extends Extension {
 
   async detail(url) {
     const res = await this.request("", {
-      headers: {
-        "Miru-Url": url,
-      },
+      headers: { "Miru-Url": url },
     });
 
-    const titleElement = await this.querySelector(
-      res,
-      "meta[property='og:title']"
-    );
+    const titleElement = await this.querySelector(res, "meta[property='og:title']");
+    const imageElement = await this.querySelector(res, "img[itemprop='image']");
 
-    const imageElement = await this.querySelector(
-      res,
-      "img[itemprop='image']"
-    );
-
-    const descElement = await this.querySelector(
-      res,
-      "p.f-desc"
-    );
-
+    const descElement = await this.querySelector(res, "p.f-desc");
+    
     const title = titleElement
       ? await titleElement.getAttributeText("content")
       : "";
@@ -98,10 +86,7 @@ export default class extends Extension {
     /*
      * Locate the player URL.
      */
-    const episodeUrlMatch = res.match(
-      /https:\/\/minoplres\.[^\s'"<>]+/i
-    );
-
+    const episodeUrlMatch = res.match(/https:\/\/minoplres\.[^\s'"<>]+/i);
     const episodeUrl = episodeUrlMatch
       ? episodeUrlMatch[0]
       : "";
@@ -109,13 +94,13 @@ export default class extends Extension {
     return {
       title: title.trim(),
       cover,
-      desc,
+      description: desc, // Renamed to follow consistent naming conventions
       episodes: [
         {
           title: "Directory",
           urls: [
             {
-              name: title.trim(),
+              name: title.trim(), 
               url: episodeUrl,
             },
           ],
@@ -126,31 +111,24 @@ export default class extends Extension {
 
   async watch(url) {
     const res = await this.request("", {
-      headers: {
-        "Miru-Url": url,
-        "Referer": "https://yomovies.energy/",
+      headers: { 
+        "Miru-Url": url, 
+        "Referer": "https://yomovies.energy/" 
       },
     });
 
     /*
      * Find HLS .m3u8 URL.
-     *
-     * This also keeps query parameters such as:
-     * ?t=...&s=...&e=...
      */
-    const hlsMatch = res.match(
-      /https?:\/\/[^\s"'<>\\]+?\.m3u8(?:\?[^\s"'<>\\]*)?/i
-    );
+    const hlsMatch = /https:\/\/[^\"'\s]+\.m3u8(?:\?[^\s"<>]*)?/i;
+    const hlsStreamUrl = res.match(hlsMatch);
 
-    if (hlsMatch) {
-      const streamUrl = hlsMatch[0];
-
+    if (hlsStreamUrl) {
       return {
         type: "hls",
-        url: streamUrl,
+        url: hlsStreamUrl[0],
         headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.142.86 Safari/537.36",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.142.86 Safari/537.36",
           "Referer": "https://yomovies.energy/",
         },
       };
@@ -159,22 +137,20 @@ export default class extends Extension {
     /*
      * MP4 fallback.
      */
-    const mp4Match = res.match(
-      /https?:\/\/[^\s"'<>\\]+?\.mp4(?:\?[^\s"'<>\\]*)?/i
-    );
+    const mp4Match = /https:\/\/[^\"'\s]+\.mp4(?:\?[^\s"<>]*)?/i;
+    const mp4StreamUrl = res.match(mp4Match);
 
-    if (mp4Match) {
+    if (mp4StreamUrl) {
       return {
         type: "mp4",
-        url: mp4Match[0],
+        url: mp4StreamUrl[0],
         headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.142.86 Safari/537.36",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.142.86 Safari/537.36",
           "Referer": "https://yomovies.energy/",
         },
       };
     }
 
-    throw new Error("No playable video URL found");
+    throw new Error("No valid stream URL found.");
   }
 }
