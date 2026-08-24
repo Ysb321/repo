@@ -1,135 +1,136 @@
 // ==MiruExtension==
-// @name         YoMovies
-// @version      v0.0.8
+// @name         HDGHaRTV
+// @version      v0.1.0
 // @author       OshekharO
-// @lang         hi
+// @lang         en
 // @license      MIT
-// @package      yomovies
+// @package      hdghartv
 // @type         bangumi
-// @icon         https://dl.memuplay.com/new_market/img/com.wYoMovies_7822289.sc1.2024-05-21-17-59-43.jpg
-// @webSite      https://yomovies.energy
-// @nsfw         false
+// @icon         https://example.com/icon.png  // Update with actual icon URL
+// @webSite      https://hdghartv.cc/
+// @nsfw        false
 // ==/MiruExtension==
 
 export default class extends Extension {
 
   async latest() {
     const res = await this.request("/");
-    const bsxList = await this.querySelectorAll(res, "div.ml-item");
+    
+    const bsxList = await this.querySelectorAll(res, "div.media");
     const novel = [];
 
     for (const element of bsxList) {
       const html = await element.content;
-  
-      const url = await this.getAttributeText(html, "a", "href");
-      const title = await this.querySelector(html, "div.qtip-title").text;
+
+      const url = await this.getAttributeText(html, ".post-title a", "href");
+      const title = await this.querySelector(html, ".post-title").text;
       const cover = await this
-        .querySelector(html, "img")
-        .getAttributeText("data-original");
+        .querySelector(html, "img.lazyload")
+        .getAttributeText("data-src");
 
       novel.push({
         title: title.trim(),
         url,
-        cover,
+        cover: cover ?? "",
       });
     }
 
-    return novel;
+    return novel.slice(0, 15); // Limiting to top 15 for performance sake
   }
 
   async search(kw) {
-    const res = await this.request(`/?s=${encodeURIComponent(kw)}`);
-    const bsxList = await this.querySelectorAll(res, "div.ml-item");
+    const res = await this.request(`/search/${encodeURIComponent(kw)}`);
+    
+    const bsxList = await this.querySelectorAll(res, "div.media");
     const novel = [];
 
     for (const element of bsxList) {
       const html = await element.content;
 
-      const url = await this.getAttributeText(html, "a", "href");
-      const title = await this.querySelector(html, "div.qtip-title").text;
+      const url = await this.getAttributeText(html, ".post-title a", "href");
+      const title = await this.querySelector(html, ".post-title").text;
       const cover = await this
-        .querySelector(html, "img")
-        .getAttributeText("data-original");
+        .querySelector(html, "img.lazyload")
+        .getAttributeText("data-src");
 
       novel.push({
         title: title.trim(),
         url,
-        cover,
+        cover: cover ?? "",
       });
     }
 
-    return novel;
+    return novel.slice(0, 15); // Limiting to top 15 for performance sake
   }
-
+  
   async detail(url) {
-    const res = await this.request("", {
-      headers: { "Miru-Url": url },
-    });
+    const res = await this.request("", { headers: { "Miru-Url": url } });
 
-    const titleElement = await this.querySelector(res, "meta[property='og:title']");
-    const imageElement = await this.querySelector(res, "img[itemprop='image']");
+    const titleElement = await this.querySelector(res, 'meta[property="og:title"]');
+    const imageElement = await this.querySelector(res, 'img[itemprop="image"]');
 
-    const descElement = await this.querySelector(res, "p.f-desc");
-    
-    const title = titleElement
-      ? await titleElement.getAttributeText("content")
-      : "";
+    const title = titleElement ? await titleElement.getAttributeText("content") : "";
+    const cover = imageElement ? await imageElement.getAttributeText("src") : "";
 
-    const cover = imageElement
-      ? await imageElement.getAttributeText("src")
-      : "";
+    let description = '';
+    try {
+      const descElement = await this.querySelector(res, "div.srpg");
+      if (descElement) description = await descElement.text;
+    } catch {}
 
-    const desc = descElement
-      ? await descElement.text
-      : "";
+    // Player URL extraction
+    let playerUrl;
 
-    /*
-     * Locate the player URL.
-     */
-    const episodeUrlMatch = res.match(/https:\/\/minoplres\.[^\s'"<>]+/i);
-    const episodeUrl = episodeUrlMatch
-      ? episodeUrlMatch[0]
-      : "";
+    const iframeRegex = /<iframe[^>]+src=["']([^"']+)["']/gi;
+    let match = null;
+    while ((match = iframeRegex.exec(res)) !== null) {
+      if (playerUrl === undefined && !match[1].includes("youtube")) {
+        playerUrl = match[1];
+      }
+    }
 
     return {
       title: title.trim(),
       cover,
-      description: desc, // Renamed to follow consistent naming conventions
+      desc: description, // Renamed for consistency
       episodes: [
-        {
-          title: "Directory",
-          urls: [
-            {
-              name: title.trim(), 
-              url: episodeUrl,
-            },
-          ],
+        { 
+          title: "Server",
+          urls: [{ name: title.trim(), url: playerUrl }]
         },
       ],
     };
   }
 
   async watch(url) {
-    const res = await this.request("", {
-      headers: { 
-        "Miru-Url": url, 
-        "Referer": "https://yomovies.energy/" 
-      },
-    });
+    const res = await this.request("", { headers: { "Miru-Url": url } });
 
     /*
      * Find HLS .m3u8 URL.
      */
     const hlsMatch = /https:\/\/[^\"'\s]+\.m3u8(?:\?[^\s"<>]*)?/i;
     const hlsStreamUrl = res.match(hlsMatch);
-
+    
     if (hlsStreamUrl) {
       return {
         type: "hls",
         url: hlsStreamUrl[0],
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.142.86 Safari/537.36",
-          "Referer": "https://yomovies.energy/",
+          "Referer": "https://hdghartv.cc/",
+        },
+      };
+    }
+
+    /*
+     * Direct link to stream.
+     */
+    if (url.match(hlsMatch)) {
+      return {
+        type: "hls",
+        url,
+        headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.142.86 Safari/537.36",
         },
       };
     }
@@ -146,7 +147,6 @@ export default class extends Extension {
         url: mp4StreamUrl[0],
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.142.86 Safari/537.36",
-          "Referer": "https://yomovies.energy/",
         },
       };
     }
