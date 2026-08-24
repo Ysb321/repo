@@ -12,6 +12,7 @@
 // ==/MiruExtension==
 
 export default class extends Extension {
+
   async latest() {
     const res = await this.request("/");
     const bsxList = await this.querySelectorAll(res, "div.ml-item");
@@ -67,21 +68,38 @@ export default class extends Extension {
       },
     });
 
-    const title = await this
-      .querySelector(res, "meta[property='og:title']")
-      .getAttributeText("content");
+    const titleElement = await this.querySelector(
+      res,
+      "meta[property='og:title']"
+    );
 
-    const cover = await this
-      .querySelector(res, "img[itemprop='image']")
-      .getAttributeText("src");
+    const imageElement = await this.querySelector(
+      res,
+      "img[itemprop='image']"
+    );
 
-    const desc = await this.querySelector(res, "p.f-desc").text;
+    const descElement = await this.querySelector(
+      res,
+      "p.f-desc"
+    );
+
+    const title = titleElement
+      ? await titleElement.getAttributeText("content")
+      : "";
+
+    const cover = imageElement
+      ? await imageElement.getAttributeText("src")
+      : "";
+
+    const desc = descElement
+      ? await descElement.text
+      : "";
 
     /*
-     * Find the video/player URL from the YoMovies page.
+     * Locate the player URL.
      */
     const episodeUrlMatch = res.match(
-      /https:\/\/minoplres\.[^\s'"<>]+/
+      /https:\/\/minoplres\.[^\s'"<>]+/i
     );
 
     const episodeUrl = episodeUrlMatch
@@ -115,40 +133,48 @@ export default class extends Extension {
     });
 
     /*
-     * Match an HLS .m3u8 URL, including signed query parameters.
+     * Find HLS .m3u8 URL.
      *
-     * Example:
-     * https://example.com/path/master.m3u8?t=xxx&s=xxx&e=xxx
+     * This also keeps query parameters such as:
+     * ?t=...&s=...&e=...
      */
-    const m3u8Match = res.match(
-      /https?:\/\/[^\s'"<>\\]+\.m3u8(?:\?[^\s'"<>\\]*)?/i
+    const hlsMatch = res.match(
+      /https?:\/\/[^\s"'<>\\]+?\.m3u8(?:\?[^\s"'<>\\]*)?/i
     );
 
-    /*
-     * Fallback for MP4 sources.
-     */
-    const mp4Match = res.match(
-      /https?:\/\/[^\s'"<>\\]+\.mp4(?:\?[^\s'"<>\\]*)?/i
-    );
+    if (hlsMatch) {
+      const streamUrl = hlsMatch[0];
 
-    const directUrl = m3u8Match
-      ? m3u8Match[0]
-      : mp4Match
-        ? mp4Match[0]
-        : "";
-
-    if (!directUrl) {
-      throw new Error("Video stream URL not found");
+      return {
+        type: "hls",
+        url: streamUrl,
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.142.86 Safari/537.36",
+          "Referer": "https://yomovies.energy/",
+        },
+      };
     }
 
-    return {
-      type: m3u8Match ? "hls" : "mp4",
-      url: directUrl,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/89.0.142.86 Safari/537.36",
-        "Referer": "https://yomovies.energy/",
-      },
-    };
+    /*
+     * MP4 fallback.
+     */
+    const mp4Match = res.match(
+      /https?:\/\/[^\s"'<>\\]+?\.mp4(?:\?[^\s"'<>\\]*)?/i
+    );
+
+    if (mp4Match) {
+      return {
+        type: "mp4",
+        url: mp4Match[0],
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.142.86 Safari/537.36",
+          "Referer": "https://yomovies.energy/",
+        },
+      };
+    }
+
+    throw new Error("No playable video URL found");
   }
 }
