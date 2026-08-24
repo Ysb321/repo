@@ -7,7 +7,7 @@
 // @package      yomovies
 // @type         bangumi
 // @icon         https://dl.memuplay.com/new_market/img/com.wYoMovies_7822289.sc1.2024-05-21-17-59-43.jpg
-// @webSite      https://yomovies.boats
+// @webSite      https://yomovies.energy
 // @nsfw         false
 // ==/MiruExtension==
 
