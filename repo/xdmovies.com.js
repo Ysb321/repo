@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         XDMovies
-// @version      v0.0.3
+// @version      v0.0.4
 // @author       Ysb321
 // @lang         hi
 // @license      MIT
@@ -14,7 +14,14 @@
 const SITE_URL = "https://top.xdmovies.wtf";
 const SITEMAP_URL = `${SITE_URL}/sitemap.xml`;
 const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
+const BROWSER_HEADERS = {
+  "User-Agent": USER_AGENT,
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Upgrade-Insecure-Requests": "1",
+};
 const TMDB_KEY = "9990db75d12d4ecd4ed84628ebc96403";
 const PROMO_HOSTS =
   /t\.me|telegram|discord|facebook|twitter|x\.com|instagram|youtube|youtu\.be|whatsapp|pinterest|reddit|play\.google|doubleclick|analytics|tagmanager|adsystem|one\.one\.one/i;
@@ -24,7 +31,12 @@ export default class extends Extension {
   async latest(page = 1) {
     const pageNumber = Number(page) > 0 ? Number(page) : 1;
     const path = pageNumber > 1 ? `/?page=${pageNumber}` : "/";
-    const html = await this.text(this.request(path));
+    const html = await this.getPage(path);
+    if (!html && this._lastError) {
+      throw new Error(
+        `XDMovies: homepage request failed (${this._lastError}). Retry, or try a VPN.`
+      );
+    }
     return this.scrapeCards(html);
   }
 
@@ -32,8 +44,8 @@ export default class extends Extension {
     const query = String(kw || "").trim();
     if (!query) return [];
 
-    const html = await this.text(
-      this.request(`/search.html?q=${encodeURIComponent(query)}`)
+    const html = await this.getPage(
+      `/search.html?q=${encodeURIComponent(query)}`
     );
     const cards = this.scrapeCards(html);
     if (cards.length) return cards;
@@ -45,15 +57,16 @@ export default class extends Extension {
 
   async detail(url) {
     const path = this.toPath(url);
-    const html = await this.text(this.request(path));
+    const html = await this.getPage(path);
     if (this.isBlockedPage(html)) {
       throw new Error(
         "XDMovies: Cloudflare is verifying this request. Open the site once in your browser, then retry."
       );
     }
     if (!html || html.length < 1200) {
+      const why = this._lastError ? ` (${this._lastError})` : "";
       throw new Error(
-        "XDMovies: the title page didn't load (empty or blocked response). The site may be rate-limiting Miru — retry, or try with a VPN."
+        `XDMovies: the title page request failed${why}. The site may be blocking Miru's requests — retry, try a VPN, and report this exact message.`
       );
     }
 
@@ -738,14 +751,49 @@ export default class extends Extension {
 
   // ---------- networking helpers ----------
 
+  // Page GET with a full browser header set, one warm-up+retry. Miru throws
+  // (Dio) on any >=400, so a Cloudflare 403 shows up here as a rejection —
+  // the underlying reason is kept in _lastError for the user-facing message.
+  async getPage(pathOrUrl, attempts = 2) {
+    const absolute = this.resolveUrl(pathOrUrl);
+    this._lastError = "";
+    let body = "";
+    for (let attempt = 0; attempt < attempts && !body; attempt += 1) {
+      try {
+        const response = await this.request("", {
+          headers: { "Miru-Url": absolute, ...BROWSER_HEADERS },
+        });
+        body = typeof response === "string" ? response : JSON.stringify(response || "");
+        if (body) return body;
+        this._lastError = "empty body";
+      } catch (e) {
+        this._lastError = String((e && (e.message || e)) || "request failed")
+          .replace(/\s+/g, " ")
+          .slice(0, 160);
+      }
+      // Retries: touch the homepage first so the shared cookie jar picks up
+      // any clearance cookies the site may set there.
+      if (attempt + 1 < attempts) {
+        try {
+          await this.request("", {
+            headers: { "Miru-Url": `${SITE_URL}/`, ...BROWSER_HEADERS },
+          });
+        } catch (_) {
+          /* warm-up best effort */
+        }
+      }
+    }
+    return body;
+  }
+
   async fetchAbsolute(absoluteUrl, referer = SITE_URL) {
     try {
       const response = await this.request("", {
         headers: {
           "Miru-Url": this.resolveUrl(absoluteUrl),
+          ...BROWSER_HEADERS,
           Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           Referer: referer || `${SITE_URL}/`,
-          "User-Agent": USER_AGENT,
         },
       });
       return this.text(response);
