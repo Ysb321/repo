@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         XDMovies
-// @version      v0.0.2
+// @version      v0.0.3
 // @author       Ysb321
 // @lang         hi
 // @license      MIT
@@ -16,6 +16,9 @@ const SITEMAP_URL = `${SITE_URL}/sitemap.xml`;
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const TMDB_KEY = "9990db75d12d4ecd4ed84628ebc96403";
+const PROMO_HOSTS =
+  /t\.me|telegram|discord|facebook|twitter|x\.com|instagram|youtube|youtu\.be|whatsapp|pinterest|reddit|play\.google|doubleclick|analytics|tagmanager|adsystem|one\.one\.one/i;
+const SIZE_TEXT = /^[\d.,]+\s*(?:GB|MB|TB|GiB|MiB)$/i;
 
 export default class extends Extension {
   async latest(page = 1) {
@@ -48,6 +51,11 @@ export default class extends Extension {
         "XDMovies: Cloudflare is verifying this request. Open the site once in your browser, then retry."
       );
     }
+    if (!html || html.length < 1200) {
+      throw new Error(
+        "XDMovies: the title page didn't load (empty or blocked response). The site may be rate-limiting Miru — retry, or try with a VPN."
+      );
+    }
 
     const title = this.cleanText(
       this.htmlTagText(html, "h1") ||
@@ -67,6 +75,7 @@ export default class extends Extension {
       Rating: "Rating",
       Genres: "Genres",
       "Release Date": "Release",
+      "First Air Date": "Release",
       Audios: "Audio",
       Sources: "Source",
     };
@@ -82,18 +91,29 @@ export default class extends Extension {
     const desc = (meta.join("\n") + (synopsis ? `\n\n${synopsis}` : "")).trim();
 
     const episodes = [];
-    const watchOnline = this.embeddedPlayers(html, path);
+    const watchOnline = this.watchServers(html, path);
     if (watchOnline.length) {
       episodes.push({ title: "Watch Online", urls: watchOnline });
     }
 
-    const downloadChannels = this.downloadChannels(html);
+    let downloadChannels = this.downloadChannels(html, path);
+    if (!downloadChannels.length) {
+      // Fallback: the site may hand the links to the page via a script (which
+      // Miru never executes). Mine the raw markup — scripts included — for
+      // download tokens/host URLs rather than only looking at anchors.
+      const mined = this.mineDownloads(html, path);
+      if (mined.length) {
+        downloadChannels = [{ title: "Download Links", urls: mined }];
+      }
+    }
     for (const channel of downloadChannels) {
       if (channel.urls.length) episodes.push(channel);
     }
 
     if (!episodes.length) {
-      throw new Error("XDMovies: no watch/download links found on this page.");
+      throw new Error(
+        "XDMovies: no watch/download links found on this page. The site may build them with a script Miru can't run — please report this title."
+      );
     }
 
     return { title, cover, desc, episodes };
@@ -241,93 +261,243 @@ export default class extends Extension {
 
   // ---------- link extraction ----------
 
-  embeddedPlayers(html, pagePath) {
-    const source = String(html || "");
-    const players = [];
-    const seen = new Set();
-    const add = (candidate) => {
-      const url = this.resolveUrl(this.decodeHtmlEntities(candidate || ""), pagePath);
-      if (
-        !url ||
-        seen.has(url) ||
-        !/^https?:\/\//i.test(url) ||
-        /google|doubleclick|facebook|twitter|discord|telegram|youtube|youtu\.be|analytics|tagmanager|adsystem/i.test(
-          url
-        )
-      ) {
-        return;
-      }
-      seen.add(url);
-      players.push({
-        name: `Server ${players.length + 1}`,
-        url: `xd:page:${encodeURIComponent(url)}`,
-      });
-    };
-
-    const tagRegex =
-      /<(?:iframe|video|source|embed)\b[^>]+(?:src|data-src|data-url|data-video|data-embed)=["']([^"']+)["'][^>]*>/gi;
-    let match;
-    while ((match = tagRegex.exec(source)) !== null) add(match[1]);
-    return players;
+  // Flatten the markup into an ordered line stream in which every anchor is a
+  // sentinel token. This makes channel/release/link association immune to the
+  // page's exact tag nesting (p > a, p > text + a, h4 file names, ...).
+  linkStream(html) {
+    let s = String(html || "")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<!--[\s\S]*?-->/g, " ");
+    // Anchors become sentinel lines; keep the raw opening tag too so links
+    // hidden in data-* attributes or onclick handlers are still recoverable.
+    s = s.replace(
+      /<a\b([^>]*)href\s*=\s*["']([^"']*)["']([^>]*)>([\s\S]*?)<\/a>/gi,
+      (all, pre, href, post, text) =>
+        `\n\u0001${href}\u0002${String(text).replace(/<[^>]+>/g, " ")}\u0003\u0005${
+          pre || ""
+        } ${post || ""}\u0006\n`
+    );
+    // Block-level boundaries become newlines (inline tags are just stripped).
+    s = s.replace(
+      /<\/?(?:p|div|h[1-6]|li|ul|ol|tr|td|th|section|article|header|footer|nav|br|hr|button|figure|figcaption)\b[^>]*>/gi,
+      "\n"
+    );
+    s = s.replace(/<[^>]+>/g, " ");
+    return this.decodeHtmlEntities(s).split(/\n+/);
   }
 
-  downloadChannels(html) {
-    const source = String(html || "");
+  releaseName(text) {
+    const t = String(text || "").replace(/\s+/g, " ").trim();
+    if (t.length < 8 || t.length > 220) return "";
+    if (/https?:|www\.|@|\||\.(?:jpe?g|png|webp|gif|ico)\b/i.test(t)) return "";
+    // Find the release name anywhere in the line (a codec badge like "H.264"
+    // may share the flattened line after it).
+    const m = t.match(/[\w[(][\w.\s\-+()\[\]]*?\.\s*(?:mkv|mp4|avi|webm|zip|mov|ts)\b/i);
+    if (!m) return "";
+    return m[0].replace(/\s*\.\s*(mkv|mp4|avi|webm|zip|mov|ts)$/i, ".$1").trim();
+  }
+
+  isGroupHeading(text) {
+    const t = String(text || "").trim();
+    if (!t || t.length > 60) return false;
+    if (this.releaseName(t)) return false;
+    if (/https?:|www\.|@/i.test(t)) return false;
+    return /season|series|packs?|zips?|episodes?|versions?|batch|parts?|collection|download|quality|encode/i.test(
+      t
+    );
+  }
+
+  isQualityHeading(text) {
+    const t = String(text || "").trim();
+    if (!t || t.length > 36) return false;
+    if (this.releaseName(t)) return false;
+    if (/(?:^|\s)(?:gb|mb|tb)(?:\s|$)/i.test(t)) return false;
+    // Resolution is mandatory so codec-only badges like "H.264" stay ignored.
+    return /(\b\d{3,4}\s?p\b|\b[48]k\b)/i.test(t);
+  }
+
+  isDownloadAnchor(rawHref, rawText, attrs, pageUrl) {
+    let href = this.decodeHtmlEntities(String(rawHref || "")).trim();
+    const text = String(rawText || "").replace(/\s+/g, " ").trim();
+    const attrText = String(attrs || "");
+    if (!href || href === "#" || /^javascript:/i.test(href)) {
+      const alt =
+        attrText.match(
+          /(?:data-(?:href|url|link|file|src|target|redirect)|data)\s*=\s*["']([^"'#]{8,})["']/i
+        ) || attrText.match(/(?:location\.href|window\.open)\s*[=(]\s*['"]([^'"]+)['"]/i);
+      if (alt) href = this.decodeHtmlEntities(alt[1]).trim();
+    }
+    const url = this.resolveUrl(href, pageUrl);
+    if (!/^https?:\/\//i.test(url)) return null;
+    if (PROMO_HOSTS.test(url)) return null;
+    if (/how-to|telegram|discord/i.test(url)) return null;
+
+    const host = (url.match(/^https?:\/\/([^/?#]+)/i) || [])[1] || "";
+    const siteHost = /(^|\.)xdmovies\.(wtf|com|icu|lol|quest)$/i.test(host) && !/^link/i.test(host);
+    const tokenPath =
+      /\/(download|dl|file|files|get|go|redirect|r|link)\/[A-Za-z0-9_\-=%.]{6,}/i.test(url) ||
+      /[?&](?:download|dl|file|id|token|key|url|u|to)=[A-Za-z0-9_\-.%/]{8,}/i.test(url);
+    const mirrorHost =
+      /hubcloud[a-z0-9.-]*|gamerxyt\.com|pixeldrain\.(?:com|dev)|drive\.google\.com\/(?:file|drive|open)|[\w.-]*\.r2\.(?:dev|cloudflarestorage\.com)|storage\.googleapis\.com/i.test(
+        url
+      );
+    const sizeButton = SIZE_TEXT.test(text);
+
+    if (tokenPath || mirrorHost) return { url, text };
+    // A bare size button ("1.08 GB") off-site is a download mirror even on a
+    // host we've never seen (covers domain rotation of the short-linker).
+    if (sizeButton && !siteHost) return { url, text };
+    return null;
+  }
+
+  downloadChannels(html, pageUrl) {
+    const lines = this.linkStream(html);
     const channels = [];
     const byTitle = new Map();
-    const push = (channel, entry) => {
-      const title = (channel || "Download Links").replace(/:\s*$/, "").trim() ||
-        "Download Links";
+    const push = (group, quality, entry) => {
+      const title =
+        [group, quality].filter(Boolean).join(" · ") || "Download Links";
       let target = byTitle.get(title);
       if (!target) {
         target = { title, urls: [] };
         byTitle.set(title, target);
         channels.push(target);
       }
+      if (target.urls.some((u) => u.url === entry.url)) return;
       target.urls.push(entry);
     };
 
-    let currentChannel = "";
+    let group = "";
+    let quality = "";
     let lastRelease = "";
-    // The content of a release-name block is bounded by a tempered pattern so
-    // a match can never swallow an intervening heading or link anchor.
-    const tokenRegex =
-      /<(?:h2|h3|h4)\b[^>]*>([\s\S]*?)<\/(?:h2|h3|h4)>|<a\b[^>]*href=["']([^"']*link\.xdmovies\.wtf\/download\/[^"']+)["'][^>]*>([\s\S]*?)<\/a>|<(?:p|span|div|strong)\b[^>]*>((?:(?!<(?:h2|h3|h4|a)\b)[^])*?\.(?:mkv|mp4|avi|webm)[^]*?)<\/(?:p|span|div|strong)>/gi;
+    const sentinel = /\u0001([^\u0002]*)\u0002([^\u0003]*)\u0003\u0005?([^\u0006]*)\u0006?/g;
 
-    let match;
-    while ((match = tokenRegex.exec(source)) !== null) {
-      const [, heading, linkHref, linkText, releaseText] = match;
-
-      if (heading !== undefined) {
-        const text = this.cleanText(heading).replace(/:\s*$/, "").trim();
-        if (/download|version|season|episode|pack/i.test(text) && text.length < 80) {
-          currentChannel = text;
+    for (const rawLine of lines) {
+      const line = String(rawLine || "");
+      let cursor = 0;
+      let m;
+      const handleText = (segment) => {
+        const text = String(segment || "").replace(/\s+/g, " ").trim();
+        if (!text) return;
+        const release = this.releaseName(text);
+        if (release) {
+          lastRelease = release;
+          return;
         }
-        continue;
-      }
-
-      if (releaseText !== undefined) {
-        const text = this.cleanText(releaseText);
-        if (/\.(mkv|mp4|avi|webm)$/i.test(text) && text.length < 200) {
-          lastRelease = text;
+        if (this.isGroupHeading(text)) {
+          group = text.replace(/[:\s]+$/, "");
+          quality = "";
+          return;
         }
-        continue;
-      }
-
-      if (linkHref) {
-        const size = this.cleanText(linkText);
-        const name = lastRelease || size || "Download";
-        push(currentChannel, {
-          name: lastRelease && size && size !== lastRelease
-            ? `${lastRelease} · ${size}`
-            : name,
-          url: `xd:file:${encodeURIComponent(this.resolveUrl(this.decodeHtmlEntities(linkHref)))}`,
+        if (this.isQualityHeading(text)) {
+          quality = text.replace(/[:\s]+$/, "");
+        }
+      };
+      sentinel.lastIndex = 0;
+      while ((m = sentinel.exec(line)) !== null) {
+        handleText(line.slice(cursor, m.index));
+        cursor = m.index + m[0].length;
+        const anchor = this.isDownloadAnchor(m[1], m[2], m[3] || "", pageUrl);
+        if (!anchor) continue;
+        const size = SIZE_TEXT.test(anchor.text) ? anchor.text : "";
+        const release = lastRelease
+          ? lastRelease.replace(/[-.\s]?xdmovies\.com/i, "").replace(/[-.\s]+$/, "")
+          : "";
+        const name = (
+          release && size ? `${release} · ${size}` : release || anchor.text || "Download"
+        ).slice(0, 200);
+        push(group, quality, {
+          name,
+          url: `xd:file:${encodeURIComponent(anchor.url)}`,
         });
         lastRelease = "";
       }
+      handleText(line.slice(cursor));
     }
+    return channels.filter((c) => c.urls.length);
+  }
 
-    return channels;
+  // Hail-Mary for script-injected links: hunt the WHOLE response (scripts,
+  // data attributes, JSON blobs) for anything shaped like a download token or
+  // a known mirror host URL.
+  mineDownloads(html, pageUrl) {
+    const raw = String(html || "")
+      .replace(/\\\//g, "/")
+      .replace(/\\u0026/gi, "&")
+      .replace(/\\u003d/gi, "=")
+      .replace(/\\x3d/gi, "=");
+    const decoded = this.decodeHtmlEntities(raw);
+    const found = [];
+    const seen = new Set();
+    const add = (candidate, label) => {
+      const url = this.resolveUrl(this.normaliseUrl(candidate), pageUrl);
+      if (!/^https?:\/\//i.test(url) || seen.has(url) || PROMO_HOSTS.test(url)) return;
+      seen.add(url);
+      found.push({
+        name: label || `Download Link ${found.length + 1}`,
+        url: `xd:file:${encodeURIComponent(url)}`,
+      });
+    };
+
+    let m;
+    const tokenRegex =
+      /https?:\/\/[\w.-]*xdmovies[\w.-]*\/download\/[A-Za-z0-9_\-]{8,}|["'(\s=](\/download\/[A-Za-z0-9_\-]{12,})["')\s]|https?:\/\/[\w.-]*hubcloud[\w.-]*\/(?:drive|file)\/[A-Za-z0-9_\-]+|https?:\/\/gamerxyt\.com\/hubcloud\.php\?[^"'<>\s\]})]{10,}|https?:\/\/pixeldrain\.(?:com|dev)\/u\/[A-Za-z0-9]+/gi;
+    while ((m = tokenRegex.exec(decoded)) !== null) {
+      add(m[1] || m[0]);
+    }
+    // Base64-encoded URLs ("aHR0cHM6Ly8..." === "https://...") are a common
+    // obfuscation on gated pages; decode and check for known hosts.
+    if (typeof atob === "function") {
+      const b64 = /aHR0cHM6Ly9[A-Za-z0-9+/=]{16,}/g;
+      while ((m = b64.exec(decoded)) !== null) {
+        try {
+          const plain = atob(m[0]);
+          if (/hubcloud|gamerxyt|pixeldrain|xdmovies/i.test(plain)) add(plain);
+        } catch (_) {
+          /* not valid base64 */
+        }
+      }
+    }
+    return found;
+  }
+
+  watchServers(html, pagePath) {
+    const source = String(html || "");
+    const players = [];
+    const seen = new Set();
+    const add = (candidate, label) => {
+      const url = this.resolveUrl(this.decodeHtmlEntities(candidate || ""), pagePath);
+      if (!url || seen.has(url) || !/^https?:\/\//i.test(url) || PROMO_HOSTS.test(url)) {
+        return;
+      }
+      if (/\/?(download|dl)\//i.test(url) || /link\.xdmovies/i.test(url)) return;
+      seen.add(url);
+      players.push({
+        name: label || `Server ${players.length + 1}`,
+        url: `xd:page:${encodeURIComponent(url)}`,
+      });
+    };
+
+    const tagRegex =
+      /<(?:iframe|video|source|embed)\b[^>]+(?:src|data-src|data-url|data-video|data-embed|data-lazy-src)=["']([^"']+)["'][^>]*>/gi;
+    let match;
+    while ((match = tagRegex.exec(source)) !== null) add(match[1]);
+
+    // "Watch Online / Play" buttons that link to a player page instead of an
+    // inline iframe.
+    const anchorRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    while ((match = anchorRegex.exec(source)) !== null) {
+      const text = this.cleanText(match[2]);
+      const href = match[1];
+      if (
+        /(watch\s*(online|now)|play\s*(now|online)|stream\s*(now|online))/i.test(text) ||
+        /\/(watch|play|embed|player|stream)[/?=-]/i.test(href)
+      ) {
+        add(href, text && text.length <= 30 ? text : "");
+      }
+    }
+    return players.slice(0, 8);
   }
 
   // ---------- playback resolution ----------
@@ -359,13 +529,12 @@ export default class extends Extension {
   async resolveDownload(pageUrl) {
     let currentUrl = this.resolveUrl(pageUrl);
 
-    for (let attempt = 0; attempt < 5 && currentUrl; attempt += 1) {
-      // Plain-HTML pages we may safely GET. File/mirror links are never
-      // fetched — Dio buffers whole responses, so those are handed to the
-      // player directly (it streams them and supports resume).
-      const host = (currentUrl.match(/^https?:\/\/([^/]+)/i) || [])[1] || "";
+    for (let attempt = 0; attempt < 6 && currentUrl; attempt += 1) {
+      // File/mirror links are never fetched — Dio buffers whole responses, so
+      // those are handed to the player directly (it streams them and supports
+      // resume). Only page-shaped URLs get GET-ed.
       const looksLikeFile =
-        /X-Amz-Signature|response-content-disposition|\.r2\.|storage\.googleapis\.com|pixeldrain\.|\/api\/file\/|\.(?:mkv|mp4|webm|m3u8|avi|mov|zip)(?:[?#%]|\s|"|$)/i.test(
+        /X-Amz-Signature|response-content-disposition|\.r2\.|storage\.googleapis\.com|pixeldrain\.|\/api\/file\/|\.(?:mkv|mp4|webm|m3u8|avi|mov|zip)(?:[?#%&]|\s|"|$)/i.test(
           currentUrl
         );
       if (looksLikeFile) {
@@ -381,15 +550,10 @@ export default class extends Extension {
       const media = this.extractMediaUrls(html);
       if (media.length) return this.playable(media[0], "", currentUrl);
 
-      if (
+      const turnstile =
         /turnstile|cf-chl|verify(?:ing)? you are|checking your browser|verify you are human|complete the (?:action|captcha)|timer paused|get your link/i.test(
           html
-        )
-      ) {
-        throw new Error(
-          "XDMovies: this short link needs one-time browser verification. Open it in your browser (HubCloud/FSL page loads there), or use the Watch Online server."
         );
-      }
 
       // HubCloud drive page: jump to the generated mirror list.
       if (!/hubcloud\.php\?/i.test(currentUrl)) {
@@ -417,6 +581,20 @@ export default class extends Extension {
         );
       }
 
+      // The page may embed a HubCloud/Pixeldrain/direct-file URL anywhere
+      // (script, data attribute, base64). Follow it if found.
+      const embedded = this.knownHostUrl(html, currentUrl);
+      if (embedded && embedded !== currentUrl) {
+        currentUrl = embedded;
+        continue;
+      }
+
+      if (turnstile) {
+        throw new Error(
+          "XDMovies: this short link needs one-time browser verification. Open it in your browser (HubCloud/FSL page loads there), or use the Watch Online server."
+        );
+      }
+
       // Fallback: first plausible external anchor that isn't a promo/gate.
       const fallback = this.firstExternalAnchor(html, currentUrl);
       if (fallback && fallback !== currentUrl) {
@@ -429,6 +607,31 @@ export default class extends Extension {
     throw new Error(
       "XDMovies: couldn't reach a playable FSL/direct link. The mirror steps may require a browser."
     );
+  }
+
+  knownHostUrl(html, pageUrl) {
+    const unescaped = String(html || "")
+      .replace(/\\\//g, "/")
+      .replace(/&amp;/gi, "&");
+    const direct = unescaped.match(
+      /https?:\/\/(?:[\w.-]*hubcloud[\w.-]*|gamerxyt\.com|pixeldrain\.(?:com|dev)|[\w.-]*\.r2\.(?:dev|cloudflarestorage\.com)|storage\.googleapis\.com)[^"'<>\s)\]}]{4,}/i
+    );
+    if (direct) return this.resolveUrl(this.normaliseUrl(direct[0]), pageUrl);
+    if (typeof atob === "function") {
+      const b64 = /aHR0cHM6Ly9[A-Za-z0-9+/=]{16,}/g;
+      let m;
+      while ((m = b64.exec(unescaped)) !== null) {
+        try {
+          const plain = atob(m[0]);
+          if (/hubcloud|gamerxyt|pixeldrain|\.r2\.|googleapis/i.test(plain)) {
+            return this.resolveUrl(this.normaliseUrl(plain), pageUrl);
+          }
+        } catch (_) {
+          /* ignore */
+        }
+      }
+    }
+    return "";
   }
 
   pickMirror(html, pageUrl) {
