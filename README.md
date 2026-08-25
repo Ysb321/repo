@@ -47,7 +47,7 @@ Miru extensions repository | [Miru App Download](https://github.com/miru-project
 | GoGoAnime | gogo.anime | v0.0.8 | OshekharO | en | bangumi | [Source Code](https://github.com/miru-project/repo/blob/main/repo/gogo.anime.js) |
 | 古风漫画 | gufengmh | v0.0.1 | 瑜君之学-杨瑜候 | zh | manga | [Source Code](https://github.com/miru-project/repo/blob/main/repo/gufengmh.js) |
 | G站漫画 | gzhanmh | v0.0.1 | 瑜君之学-杨瑜候 | zh | manga | [Source Code](https://github.com/miru-project/repo/blob/main/repo/gzhanmh.js) |
-| HDGharTV | hdghartv | v0.0.5 | OshekharO | hi | bangumi | [Source Code](https://github.com/miru-project/repo/blob/main/repo/hdghartv.js) |
+| HDGharTV | hdghartv | v0.0.6 | OshekharO | hi | bangumi | [Source Code](https://github.com/miru-project/repo/blob/main/repo/hdghartv.js) |
 | 黑木耳资源 | heimuer.tv | v0.0.2 | hualiong | zh-cn | bangumi | [Source Code](https://github.com/miru-project/repo/blob/main/repo/heimuer.tv.js) |
 | HiAnime | hianime.to | v0.0.8 | OshekharO | en | bangumi | [Source Code](https://github.com/miru-project/repo/blob/main/repo/hianime.to.js) |
 | 华为吧资源 | huaweiba.live | v0.0.2 | hualiong | zh-cn | bangumi | [Source Code](https://github.com/miru-project/repo/blob/main/repo/huaweiba.live.js) |

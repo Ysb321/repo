@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         HDGharTV
-// @version      v0.0.5
+// @version      v0.0.6
 // @author       OshekharO
 // @lang         hi
 // @license      MIT
@@ -111,6 +111,11 @@ export default class extends Extension {
     const result = {
       type: isMp4 ? "mp4" : "hls",
       url: streamUrl,
+      headers: {
+        "User-Agent": USER_AGENT,
+        Referer: `${SITE_URL}/`,
+        Origin: SITE_URL,
+      },
     };
     if (audioTrack && !isMp4) result.audioTrack = audioTrack;
     return result;
