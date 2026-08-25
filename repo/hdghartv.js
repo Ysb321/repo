@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         HDGharTV
-// @version      v0.0.4
+// @version      v0.0.5
 // @author       OshekharO
 // @lang         hi
 // @license      MIT
@@ -111,13 +111,6 @@ export default class extends Extension {
     const result = {
       type: isMp4 ? "mp4" : "hls",
       url: streamUrl,
-      // HDGharTV's API returns signed CDN URLs that do not require a
-      // referer. Keep a browser user-agent for CDN servers that check it.
-      headers: {
-        "User-Agent": USER_AGENT,
-        Referer: `${SITE_URL}/`,
-        Origin: SITE_URL,
-      },
     };
     if (audioTrack && !isMp4) result.audioTrack = audioTrack;
     return result;
@@ -230,15 +223,15 @@ export default class extends Extension {
     const options = [];
 
     for (const link of links || []) {
+      // At the moment HDGharTV's 480p/720p CDN entries are not playable.
+      // Keep them out of the Miru catalogue instead of presenting a link
+      // that will only fail after the user selects it.
+      if (!this.isWorkingQuality(link.quality)) continue;
+
       const hls = this.isHlsLink(link);
       const playlist = hls ? await this.fetchPlaylist(link.url) : "";
-
-      // Do not expose links that the CDN no longer serves. In particular,
-      // HDGharTV sometimes leaves stale 480p/720p records in its API.
-      if (hls && !this.isPlaylist(playlist)) continue;
-
-      const quality = this.cleanText(link.quality || "HD");
-      const tracks = await this.parseAudioTracks(playlist, link.url);
+      const quality = this.cleanText(link.quality || "1080p");
+      const tracks = this.parseAudioTracks(playlist, link.url);
 
       if (tracks.length) {
         for (const track of tracks) {
@@ -266,6 +259,11 @@ export default class extends Extension {
     );
   }
 
+  isWorkingQuality(quality) {
+    // Keep this allow-list explicit so broken 480p/720p records never appear.
+    return /1080/i.test(String(quality || ""));
+  }
+
   isHlsLink(link) {
     const type = String(link && link.type || "").toLowerCase();
     return /hls|m3u8/.test(type) || /\.m3u8(?:$|[?#])/i.test(link && link.url || "");
@@ -275,7 +273,7 @@ export default class extends Extension {
     return /#EXTM3U/i.test(String(value || ""));
   }
 
-  async parseAudioTracks(playlist, baseUrl) {
+  parseAudioTracks(playlist, baseUrl) {
     if (!this.isPlaylist(playlist)) return [];
 
     const tracks = [];
@@ -296,12 +294,9 @@ export default class extends Extension {
       const trackUrl = this.resolveUrl(uri, baseUrl);
       if (!trackUrl || seen.has(trackUrl)) continue;
 
-      // A master playlist can retain an audio entry whose signed URL has
-      // expired. Check the audio playlist too, otherwise Miru would show a
-      // language option that cannot play.
-      const trackPlaylist = await this.fetchPlaylist(trackUrl);
-      if (!this.isPlaylist(trackPlaylist)) continue;
-
+      // The master playlist is the source of truth for alternate audio. Do
+      // not make another CDN request here: some valid audio playlists reject
+      // a metadata probe even though Miru can load them during playback.
       seen.add(trackUrl);
       tracks.push({
         name: this.cleanText(name || "Audio"),
