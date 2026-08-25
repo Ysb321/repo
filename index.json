@@ -635,6 +635,19 @@
   "webSite": "https://hanime1.me"
  },
  {
+  "author": "OshekharO",
+  "icon": "https://hdghartv.cc/favicon.ico",
+  "lang": "hi",
+  "license": "MIT",
+  "name": "HDGharTV",
+  "nsfw": "false",
+  "package": "hdghartv",
+  "type": "bangumi",
+  "url": "hdghartv.js",
+  "version": "v0.1.2",
+  "webSite": "https://hdghartv.cc"
+ },
+ {
   "author": "hualiong",
   "icon": "https://heimuer.tv/favicon.ico",
   "lang": "zh-cn",
@@ -1961,8 +1974,8 @@
   "package": "yomovies",
   "type": "bangumi",
   "url": "yomovies.js",
-  "version": "v0.0.7",
-  "webSite": "https://yomovies.boats"
+  "version": "v0.0.9",
+  "webSite": "https://yomovies.energy"
  },
  {
   "author": "appdevelpo",
