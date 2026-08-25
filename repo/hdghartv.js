@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         HDGharTV
-// @version      v0.1.1
+// @version      v0.1.2
 // @author       OshekharO
 // @lang         hi
 // @license      MIT
@@ -195,9 +195,16 @@ export default class extends Extension {
     return this.fetchHtml(this.resolveUrl(url), SITE_URL);
   }
 
+  isBlockedPage(value) {
+    const source = this.asText(value);
+    return /attention required!\s*\|\s*cloudflare|sorry,?\s+you have been blocked|you are unable to access hdghartv\.cc/i.test(
+      source
+    );
+  }
+
   scrapeCatalog(html) {
     const source = this.asText(html);
-    if (!source || /cloudflare|attention required/i.test(source)) return [];
+    if (!source || this.isBlockedPage(source)) return [];
 
     const results = [];
     const seen = new Set();
@@ -242,7 +249,7 @@ export default class extends Extension {
 
   scrapeDetail(html, pageUrl) {
     const source = this.asText(html);
-    if (!source || /cloudflare|attention required/i.test(source)) return null;
+    if (!source || this.isBlockedPage(source)) return null;
 
     const title = this.cleanText(
       this.htmlTagText(source, "h1") ||
