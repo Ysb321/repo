@@ -635,6 +635,19 @@
   "webSite": "https://hanime1.me"
  },
  {
+  "author": "OshekharO",
+  "icon": "https://hdghartv.cc/favicon.ico",
+  "lang": "hi",
+  "license": "MIT",
+  "name": "HDGharTV",
+  "nsfw": "false",
+  "package": "hdghartv",
+  "type": "bangumi",
+  "url": "hdghartv.js",
+  "version": "v0.0.1",
+  "webSite": "https://hdghartv.cc"
+ },
+ {
   "author": "hualiong",
   "icon": "https://heimuer.tv/favicon.ico",
   "lang": "zh-cn",
