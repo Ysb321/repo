@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         XDMovies
-// @version      v0.0.4
+// @version      v0.0.5
 // @author       Ysb321
 // @lang         hi
 // @license      MIT
@@ -751,39 +751,72 @@ export default class extends Extension {
 
   // ---------- networking helpers ----------
 
-  // Page GET with a full browser header set, one warm-up+retry. Miru throws
-  // (Dio) on any >=400, so a Cloudflare 403 shows up here as a rejection —
-  // the underlying reason is kept in _lastError for the user-facing message.
-  async getPage(pathOrUrl, attempts = 2) {
+  // Page GET with a full browser header set. Cloudflare 403s the content
+  // pages for Miru's client fingerprint specifically (home/search pass),
+  // so on failure we first retry after a homepage warm-up, then route the
+  // same URL through public raw-HTML relays that fetch from their own
+  // infrastructure. Miru throws (Dio) on any >=400 — the underlying reason
+  // is kept in _lastError for the user-facing message.
+  async getPage(pathOrUrl) {
     const absolute = this.resolveUrl(pathOrUrl);
     this._lastError = "";
-    let body = "";
-    for (let attempt = 0; attempt < attempts && !body; attempt += 1) {
+    const relayUrls = [
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(absolute)}`,
+      `https://api.codetabs.com/v1/proxy?quest=${absolute}`,
+      `https://proxy.corsfix.com/?${absolute}`,
+      `https://api.cors.lol/?url=${encodeURIComponent(absolute)}`,
+    ];
+
+    const tryGet = async (target, extraHeaders = {}) => {
       try {
         const response = await this.request("", {
-          headers: { "Miru-Url": absolute, ...BROWSER_HEADERS },
+          headers: { "Miru-Url": target, ...BROWSER_HEADERS, ...extraHeaders },
         });
-        body = typeof response === "string" ? response : JSON.stringify(response || "");
-        if (body) return body;
-        this._lastError = "empty body";
+        const body =
+          typeof response === "string" ? response : JSON.stringify(response || "");
+        return { body, error: "" };
       } catch (e) {
-        this._lastError = String((e && (e.message || e)) || "request failed")
-          .replace(/\s+/g, " ")
-          .slice(0, 160);
+        return {
+          body: "",
+          error: String((e && (e.message || e)) || "request failed")
+            .replace(/\s+/g, " ")
+            .slice(0, 160),
+        };
       }
-      // Retries: touch the homepage first so the shared cookie jar picks up
-      // any clearance cookies the site may set there.
-      if (attempt + 1 < attempts) {
-        try {
-          await this.request("", {
-            headers: { "Miru-Url": `${SITE_URL}/`, ...BROWSER_HEADERS },
-          });
-        } catch (_) {
-          /* warm-up best effort */
-        }
+    };
+
+    const reasons = [];
+    // Pass 1: direct, twice with a homepage warm-up in between (the shared
+    // cookie jar may pick up clearance cookies set on the front page).
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const got = await tryGet(absolute);
+      if (got.body && (this.isBlockedPage(got.body) || got.body.length >= 200)) {
+        return got.body;
       }
+      reasons.push(got.error || "empty body");
+      if (attempt === 0) await tryGet(`${SITE_URL}/`);
     }
-    return body;
+
+    // Pass 2: relays (their servers fetch the page, not the local client).
+    for (const relay of relayUrls) {
+      const extra = relay.includes("corsfix") ? { Origin: "https://miru.local" } : {};
+      const got = await tryGet(relay, extra);
+      if (got.body && !this.isRelayJunk(got.body) && got.body.length >= 200) {
+        return got.body;
+      }
+      reasons.push(got.error || (got.body ? "relay rejected" : "relay empty"));
+    }
+
+    this._lastError = reasons.find(Boolean) || "";
+    return "";
+  }
+
+  // Error/rate-limit pages of the relay services themselves.
+  isRelayJunk(body) {
+    const source = String(body || "");
+    return /error code 5\d\d|connection timed out|rate limit exceeded|invalid_origin|missing a valid origin|temporarily rate limited|please check back later|usage is limited to localhost/i.test(
+      source
+    );
   }
 
   async fetchAbsolute(absoluteUrl, referer = SITE_URL) {
