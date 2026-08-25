@@ -296,7 +296,11 @@ export default class extends Extension {
       const uri = this.hlsAttribute(line, "URI");
       if (!uri) continue;
       const language = this.hlsAttribute(line, "LANGUAGE");
-      const name = this.hlsAttribute(line, "NAME") || this.languageName(language);
+      const trackName = this.hlsAttribute(line, "NAME");
+      const name =
+        (trackName && !/^default|audio$/i.test(trackName) && trackName) ||
+        this.languageName(language) ||
+        "Audio";
       const trackUrl = this.resolveUrl(uri, link.url);
       if (!trackUrl || seen.has(trackUrl)) continue;
       seen.add(trackUrl);
@@ -341,20 +345,35 @@ export default class extends Extension {
   languageName(code) {
     const names = {
       bn: "Bengali",
+      ben: "Bengali",
       en: "English",
+      eng: "English",
       es: "Spanish",
+      spa: "Spanish",
       fr: "French",
+      fra: "French",
       hi: "Hindi",
+      hin: "Hindi",
       id: "Indonesian",
+      ind: "Indonesian",
       ja: "Japanese",
+      jpn: "Japanese",
       kn: "Kannada",
+      kan: "Kannada",
       ko: "Korean",
+      kor: "Korean",
       ml: "Malayalam",
+      mal: "Malayalam",
       mr: "Marathi",
+      mar: "Marathi",
       pa: "Punjabi",
+      pan: "Punjabi",
       ta: "Tamil",
+      tam: "Tamil",
       te: "Telugu",
+      tel: "Telugu",
       ur: "Urdu",
+      urd: "Urdu",
     };
     const value = String(code || "").trim();
     const normalized = value.toLowerCase();
@@ -362,9 +381,11 @@ export default class extends Extension {
   }
 
   packSource(link, audioTrack = "") {
-    const type = /mp4|webm/i.test(String(link.type || link.url))
-      ? "mp4"
-      : "hls";
+    const declaredType = String(link.type || "").toLowerCase();
+    const isMp4 =
+      /mp4|webm/.test(declaredType) ||
+      /\.(?:mp4|webm)(?:$|[?#])/i.test(String(link.url || ""));
+    const type = isMp4 ? "mp4" : "hls";
     const source = `hdghartv:${type}:${encodeURIComponent(link.url)}`;
     return audioTrack ? `${source}:${encodeURIComponent(audioTrack)}` : source;
   }
