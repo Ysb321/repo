@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         HDGharTV
-// @version      v0.1.0
+// @version      v0.1.1
 // @author       OshekharO
 // @lang         hi
 // @license      MIT
@@ -55,18 +55,7 @@ export default class extends Extension {
     }
 
     const data = await this.api(`/search?q=${encoded}`);
-    const items = [
-      ...(Array.isArray(data && data.movies) ? data.movies : []).map((item) => ({
-        ...item,
-        mediaType: "movie",
-      })),
-      ...(Array.isArray(data && data.series) ? data.series : []).map((item) => ({
-        ...item,
-        mediaType: "series",
-      })),
-    ];
-
-    return await this.toSearchResults(items);
+    return await this.toSearchResults(this.searchItems(data));
   }
 
   async detail(url) {
@@ -86,15 +75,16 @@ export default class extends Extension {
       throw new Error("HDGharTV: unable to load the movie details.");
     }
 
-    const title = this.cleanText(data.title || data.name || "HDGharTV");
-    const cover = this.imageValue(data);
+    const payload = data.data && typeof data.data === "object" ? data.data : data;
+    const title = this.cleanText(payload.title || payload.name || "HDGharTV");
+    const cover = this.imageValue(payload);
     const desc = this.cleanText(
-      data.description || data.overview || data.plot || data.synopsis || ""
+      payload.description || payload.overview || payload.plot || payload.synopsis || ""
     );
 
     const episodes = mediaType === "series"
-      ? await this.seriesEpisodes(data)
-      : await this.movieEpisodes(data, title);
+      ? await this.seriesEpisodes(payload)
+      : await this.movieEpisodes(payload, title);
 
     return {
       title,
@@ -430,35 +420,76 @@ export default class extends Extension {
   }
 
   async api(path) {
-    try {
-      const response = await this.request("", {
-        headers: {
-          "Miru-Url": `${API_URL}${path}`,
-          Accept: "application/json, */*",
-          "Accept-Language": "en-US,en;q=0.9",
-          Referer: `${SITE_URL}/`,
-          "User-Agent": USER_AGENT,
-        },
-      });
-
-      if (typeof response === "string") {
-        try {
-          return JSON.parse(response);
-        } catch (_) {
-          return null;
-        }
-      }
-      return response;
-    } catch (_) {
-      return null;
+    const paths = [path];
+    if (path.indexOf("/search?q=") === 0) {
+      paths.push(path.replace("/search?q=", "/search/suggestions?q="));
     }
+
+    for (const requestPath of paths) {
+      try {
+        const response = await this.request("", {
+          headers: {
+            "Miru-Url": `${API_URL}${requestPath}`,
+            Accept: "application/json, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            Referer: `${SITE_URL}/`,
+            "User-Agent": USER_AGENT,
+          },
+        });
+
+        if (typeof response === "string") {
+          try {
+            const data = JSON.parse(response);
+            if (data) return data;
+          } catch (_) {
+            // Try the alternate endpoint for a non-JSON Cloudflare response.
+          }
+        } else if (response) {
+          return response;
+        }
+      } catch (_) {
+        // Continue to the alternate endpoint.
+      }
+    }
+    return null;
+  }
+
+  searchItems(data) {
+    if (Array.isArray(data)) {
+      return data.map((item) => ({
+        ...item,
+        mediaType: /series|tv/i.test(String(item && (item.type || item.mediaType)))
+          ? "series"
+          : "movie",
+      }));
+    }
+    if (!data || typeof data !== "object") return [];
+
+    const payload = data.data && typeof data.data === "object" ? data.data : data;
+    return [
+      ...(Array.isArray(payload.movies) ? payload.movies : []).map((item) => ({
+        ...item,
+        mediaType: "movie",
+      })),
+      ...(Array.isArray(payload.series) ? payload.series : []).map((item) => ({
+        ...item,
+        mediaType: "series",
+      })),
+      ...(Array.isArray(payload.results) ? payload.results : []).map((item) => ({
+        ...item,
+        mediaType: /series|tv/i.test(String(item && (item.type || item.mediaType)))
+          ? "series"
+          : "movie",
+      })),
+    ];
   }
 
   catalogItems(data) {
     if (Array.isArray(data)) return data;
     if (!data || typeof data !== "object") return [];
-    for (const key of ["movies", "series", "results", "items", "data"]) {
-      if (Array.isArray(data[key])) return data[key];
+    const payload = data.data && typeof data.data === "object" ? data.data : data;
+    for (const key of ["movies", "series", "results", "items"]) {
+      if (Array.isArray(payload[key])) return payload[key];
     }
     return [];
   }
@@ -492,7 +523,9 @@ export default class extends Extension {
   }
 
   async movieEpisodes(data, title) {
-    const links = this.activeLinks(data && data.streamingLinks);
+    const links = this.activeLinks(
+      data && (data.streamingLinks || data.streams || data.sources || data.links)
+    );
     const urls = await this.linkOptions(links, title);
     return urls.length ? [{ title: "HDGharTV", urls }] : [];
   }
@@ -517,7 +550,9 @@ export default class extends Extension {
         const episodeTitle = this.cleanText(
           episode && (episode.name || episode.title || `Episode ${episodeNumber}`)
         );
-        const links = this.activeLinks(episode && episode.streamingLinks);
+        const links = this.activeLinks(
+          episode && (episode.streamingLinks || episode.streams || episode.sources || episode.links)
+        );
         urls.push(...(await this.linkOptions(links, episodeTitle)));
       }
 
@@ -566,8 +601,9 @@ export default class extends Extension {
   }
 
   activeLinks(links) {
-    if (!Array.isArray(links)) return [];
-    return links
+    if (!links) return [];
+    const list = Array.isArray(links) ? links : Object.values(links);
+    return list
       .map((link) => {
         if (!link || typeof link !== "object") return null;
         return {
@@ -744,12 +780,17 @@ export default class extends Extension {
     const direct = this.firstValue([
       item.image,
       item.imageUrl,
+      item.image_url,
       item.poster,
       item.posterUrl,
+      item.poster_url,
       item.thumbnail,
       item.thumbnailUrl,
+      item.thumbnail_url,
       item.cover,
       item.backdrop,
+      item.backdropUrl,
+      item.backdrop_url,
     ]);
     if (direct) return this.resolveUrl(direct);
 
@@ -817,7 +858,11 @@ export default class extends Extension {
     return String(value || "")
       .trim()
       .replace(/\\\//g, "/")
-      .replace(/&amp;/gi, "&");
+      .replace(/\\u0026/gi, "&")
+      .replace(/\\u003f/gi, "?")
+      .replace(/\\u003d/gi, "=")
+      .replace(/&amp;/gi, "&")
+      .replace(/[),;}]$/g, "");
   }
 
 }
