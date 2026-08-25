@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         HDGharTV
-// @version      v0.0.1
+// @version      v0.0.2
 // @author       OshekharO
 // @lang         hi
 // @license      MIT
