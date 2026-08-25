@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         HDGharTV
-// @version      v0.0.2
+// @version      v0.0.3
 // @author       OshekharO
 // @lang         hi
 // @license      MIT
@@ -28,7 +28,7 @@ export default class extends Extension {
     for (const endpoint of endpoints) {
       const data = await this.api(endpoint);
       const movies = this.catalogItems(data);
-      if (movies.length) return this.toSearchResults(movies);
+      if (movies.length) return await this.toSearchResults(movies);
     }
 
     // The public API currently documents search rather than a catalogue
@@ -52,7 +52,7 @@ export default class extends Extension {
       })),
     ];
 
-    return this.toSearchResults(items);
+    return await this.toSearchResults(items);
   }
 
   async detail(url) {
@@ -69,14 +69,7 @@ export default class extends Extension {
     }
 
     const title = this.cleanText(data.title || data.name || "HDGharTV");
-    const cover = this.firstValue([
-      data.poster,
-      data.posterUrl,
-      data.image,
-      data.imageUrl,
-      data.thumbnail,
-      data.backdrop,
-    ]);
+    const cover = this.imageValue(data);
     const desc = this.cleanText(
       data.description || data.overview || data.plot || data.synopsis || ""
     );
@@ -164,7 +157,7 @@ export default class extends Extension {
     return [];
   }
 
-  toSearchResults(items) {
+  async toSearchResults(items) {
     const results = [];
     const seen = new Set();
 
@@ -178,18 +171,14 @@ export default class extends Extension {
       if (seen.has(url)) continue;
       seen.add(url);
 
-      const cover = this.firstValue([
-        item.image,
-        item.imageUrl,
-        item.poster,
-        item.posterUrl,
-        item.thumbnail,
-        item.backdrop,
-      ]);
+      let cover = this.imageValue(item);
+      if (!cover && item.tmdbId) {
+        cover = await this.tmdbImage(item.tmdbId, mediaType);
+      }
       results.push({
         title,
         url,
-        cover: this.resolveUrl(cover),
+        cover,
       });
     }
 
@@ -243,23 +232,45 @@ export default class extends Extension {
 
   async linkOptions(links, label) {
     const options = [];
+    const preferred = this.preferredLink(links);
+    const preferredPlaylist = preferred && this.isHlsLink(preferred)
+      ? await this.fetchPlaylist(preferred.url)
+      : "";
+    const preferredIsPlayable = this.isPlaylist(preferredPlaylist);
 
     for (const link of links || []) {
+      let sourceLink = link;
+      let playlist = this.isHlsLink(link)
+        ? await this.fetchPlaylist(link.url)
+        : "";
+
+      // A few HDGharTV entries expose stale 720p/480p URLs even though the
+      // 1080p master is valid. Keep the quality option usable by falling back
+      // to that master; the label makes the fallback visible to the user.
+      const staleHls = this.isHlsLink(link) && !this.isPlaylist(playlist);
+      if (staleHls && preferredIsPlayable && preferred.url !== link.url) {
+        sourceLink = preferred;
+        playlist = preferredPlaylist;
+      }
+
       const quality = this.cleanText(link.quality || "HD");
-      const tracks = await this.audioTracks(link);
+      const fallbackLabel = sourceLink === link
+        ? quality
+        : `${quality} (fallback ${this.cleanText(sourceLink.quality || "HD")})`;
+      const tracks = this.parseAudioTracks(playlist, sourceLink.url);
 
       if (tracks.length) {
         for (const track of tracks) {
           options.push({
-            name: `${label} · ${quality} · ${track.name}`.trim(),
-            url: this.packSource(link, track.url),
+            name: `${label} · ${fallbackLabel} · ${track.name}`.trim(),
+            url: this.packSource(sourceLink, track.url),
           });
         }
       } else {
-        const language = this.languageFromLink(link);
+        const language = this.languageFromLink(sourceLink);
         options.push({
-          name: `${label} · ${quality}${language ? ` · ${language}` : ""}`.trim(),
-          url: this.packSource(link),
+          name: `${label} · ${fallbackLabel}${language ? ` · ${language}` : ""}`.trim(),
+          url: this.packSource(sourceLink),
         });
       }
     }
@@ -274,21 +285,31 @@ export default class extends Extension {
     );
   }
 
-  async audioTracks(link) {
-    const linkType = String(link && link.type || "").toLowerCase();
-    if (
-      /mp4|webm/.test(linkType) ||
-      (!/hls|m3u8/.test(linkType) && !/\.m3u8(?:$|[?#])/i.test(link.url || ""))
-    ) {
-      return [];
-    }
+  preferredLink(links) {
+    return (links || []).slice().sort((a, b) => {
+      const quality = (link) => {
+        const match = String(link && link.quality || "").match(/(\d{3,4})/);
+        return match ? Number(match[1]) : 0;
+      };
+      return quality(b) - quality(a);
+    })[0];
+  }
 
-    const playlist = await this.fetchPlaylist(link.url);
-    if (!playlist) return [];
+  isHlsLink(link) {
+    const type = String(link && link.type || "").toLowerCase();
+    return /hls|m3u8/.test(type) || /\.m3u8(?:$|[?#])/i.test(link && link.url || "");
+  }
+
+  isPlaylist(value) {
+    return /#EXTM3U/i.test(String(value || ""));
+  }
+
+  parseAudioTracks(playlist, baseUrl) {
+    if (!this.isPlaylist(playlist)) return [];
 
     const tracks = [];
     const seen = new Set();
-    for (const line of playlist.split(/\r?\n/)) {
+    for (const line of String(playlist).split(/\r?\n/)) {
       if (!/#EXT-X-MEDIA:/i.test(line) || !/TYPE\s*=\s*"?AUDIO/i.test(line)) {
         continue;
       }
@@ -301,7 +322,7 @@ export default class extends Extension {
         (trackName && !/^default|audio$/i.test(trackName) && trackName) ||
         this.languageName(language) ||
         "Audio";
-      const trackUrl = this.resolveUrl(uri, link.url);
+      const trackUrl = this.resolveUrl(uri, baseUrl);
       if (!trackUrl || seen.has(trackUrl)) continue;
       seen.add(trackUrl);
       tracks.push({
@@ -320,6 +341,7 @@ export default class extends Extension {
           "Miru-Url": url,
           Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*",
           Referer: `${SITE_URL}/`,
+          Origin: SITE_URL,
           "User-Agent": USER_AGENT,
         },
       });
@@ -382,18 +404,83 @@ export default class extends Extension {
 
   packSource(link, audioTrack = "") {
     const declaredType = String(link.type || "").toLowerCase();
-    const isMp4 =
-      /mp4|webm/.test(declaredType) ||
-      /\.(?:mp4|webm)(?:$|[?#])/i.test(String(link.url || ""));
+    const sourceUrl = String(link.url || "");
+    const isHls =
+      /hls|m3u8/.test(declaredType) ||
+      /\.m3u8(?:$|[?#])/i.test(sourceUrl);
+    const isMp4 = !isHls &&
+      (/mp4|webm/.test(declaredType) ||
+        /\.(?:mp4|webm)(?:$|[?#])/i.test(sourceUrl));
     const type = isMp4 ? "mp4" : "hls";
     const source = `hdghartv:${type}:${encodeURIComponent(link.url)}`;
     return audioTrack ? `${source}:${encodeURIComponent(audioTrack)}` : source;
   }
 
+  async tmdbImage(id, mediaType) {
+    const contentType = mediaType === "series" ? "tv" : "movie";
+    const endpoint = `https://api.themoviedb.org/3/${contentType}/${encodeURIComponent(
+      id
+    )}?api_key=9990db75d12d4ecd4ed84628ebc96403`;
+
+    try {
+      const response = await this.request("", {
+        headers: {
+          "Miru-Url": endpoint,
+          Accept: "application/json, */*",
+          "User-Agent": USER_AGENT,
+        },
+      });
+      const data = typeof response === "string"
+        ? JSON.parse(response)
+        : response;
+      const path = data && (data.poster_path || data.backdrop_path);
+      return path
+        ? `https://image.tmdb.org/t/p/w500/${String(path).replace(/^\/+/, "")}`
+        : "";
+    } catch (_) {
+      return "";
+    }
+  }
+
+  imageValue(item) {
+    if (!item || typeof item !== "object") return "";
+
+    const direct = this.firstValue([
+      item.image,
+      item.imageUrl,
+      item.poster,
+      item.posterUrl,
+      item.thumbnail,
+      item.thumbnailUrl,
+      item.cover,
+      item.backdrop,
+    ]);
+    if (direct) return this.resolveUrl(direct);
+
+    const tmdbPath = this.firstValue([
+      item.poster_path,
+      item.posterPath,
+    ]);
+    if (tmdbPath) {
+      return `https://image.tmdb.org/t/p/w500/${tmdbPath.replace(/^\/+/, "")}`;
+    }
+    return "";
+  }
+
   firstValue(values) {
-    return (values || []).find(
-      (value) => typeof value === "string" && value.trim()
-    ) || "";
+    for (const value of values || []) {
+      if (typeof value === "string" && value.trim()) return value.trim();
+      if (value && typeof value === "object") {
+        const nested = this.firstValue([
+          value.url,
+          value.src,
+          value.path,
+          value.original,
+        ]);
+        if (nested) return nested;
+      }
+    }
+    return "";
   }
 
   resolveUrl(value, base = SITE_URL) {
