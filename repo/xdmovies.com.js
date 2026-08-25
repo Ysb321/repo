@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         XDMovies
-// @version      v0.0.5
+// @version      v0.0.6
 // @author       Ysb321
 // @lang         hi
 // @license      MIT
@@ -12,9 +12,13 @@
 // ==/MiruExtension==
 
 const SITE_URL = "https://top.xdmovies.wtf";
+const API_URL = "https://new.xdmovies.wtf";
 const SITEMAP_URL = `${SITE_URL}/sitemap.xml`;
+// Static token the site's own web app sends (see the public phisher98 /
+// nuvio provider). Overridable in the extension settings if it rotates.
+const DEFAULT_API_TOKEN = "7297skkihkajwnsgaklakshuwd";
 const USER_AGENT =
-  "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
 const BROWSER_HEADERS = {
   "User-Agent": USER_AGENT,
   Accept:
@@ -28,7 +32,62 @@ const PROMO_HOSTS =
 const SIZE_TEXT = /^[\d.,]+\s*(?:GB|MB|TB|GiB|MiB)$/i;
 
 export default class extends Extension {
+  async load() {
+    // Optional knobs (Miru: extension info page -> settings).
+    try {
+      this.registerSetting({
+        title: "XDMovies API token (only if requests stop working)",
+        key: "xdmovies_api_token",
+        type: "input",
+        defaultValue: "",
+      });
+      this.registerSetting({
+        title:
+          "FlareSolverr URL (optional Cloudflare solver, e.g. http://127.0.0.1:8191/v1 — github.com/FlareSolverr/FlareSolverr)",
+        key: "xdmovies_solver_url",
+        type: "input",
+        defaultValue: "",
+      });
+    } catch (_) {
+      /* older Miru builds without settings support */
+    }
+  }
+
+  async getSettingSafe(key) {
+    try {
+      const value = await this.getSetting(key);
+      return typeof value === "string" ? value.trim() : "";
+    } catch (_) {
+      return "";
+    }
+  }
+
+  async ensureToken() {
+    if (this._token !== undefined) return;
+    this._token = (await this.getSettingSafe("xdmovies_api_token")) || DEFAULT_API_TOKEN;
+  }
+
+  // Header set for a request: full browser headers everywhere, plus the
+  // site's own app-trust headers (the same ones its official app sends) for
+  // any xdmovies host. Cloudflare clearance cookies captured by a solver
+  // are replayed only to the site itself.
+  siteHeaders(targetUrl, extra = {}) {
+    const host = (String(targetUrl).match(/^https?:\/\/([^/]+)/i) || [])[1] || "";
+    const headers = { ...BROWSER_HEADERS, ...extra };
+    if (/(^|\.)xdmovies\.wtf$/i.test(host)) {
+      headers["x-requested-with"] = "XMLHttpRequest";
+      headers["x-auth-token"] = this._token || DEFAULT_API_TOKEN;
+      if (!extra.Referer) headers.Referer = `${API_URL}/`;
+      if (this._cfCookies) {
+        headers.Cookie = this._cfCookies;
+        if (this._cfUA) headers["User-Agent"] = this._cfUA;
+      }
+    }
+    return headers;
+  }
+
   async latest(page = 1) {
+    await this.ensureToken();
     const pageNumber = Number(page) > 0 ? Number(page) : 1;
     const path = pageNumber > 1 ? `/?page=${pageNumber}` : "/";
     const html = await this.getPage(path);
@@ -41,8 +100,13 @@ export default class extends Extension {
   }
 
   async search(kw, page = 1) {
+    await this.ensureToken();
     const query = String(kw || "").trim();
     if (!query) return [];
+
+    // Primary: the site's own JSON search API (same endpoint its app uses).
+    const apiCards = await this.apiSearch(query);
+    if (apiCards && apiCards.length) return apiCards;
 
     const html = await this.getPage(
       `/search.html?q=${encodeURIComponent(query)}`
@@ -55,7 +119,68 @@ export default class extends Extension {
     return this.sitemapSearch(query);
   }
 
+  // JSON catalogue search: GET /php/search_api.php?query=<kw>&fuzzy=true
+  // with the app headers. Returns [{tmdb_id, path, ...}] — field names
+  // beyond those two are parsed defensively.
+  async apiSearch(query) {
+    const url = `${API_URL}/php/search_api.php?query=${encodeURIComponent(
+      query
+    )}&fuzzy=true`;
+    try {
+      const response = await this.request("", {
+        headers: { "Miru-Url": url, ...this.siteHeaders(url, { Accept: "application/json" }) },
+      });
+      const text = typeof response === "string" ? response : JSON.stringify(response || "");
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (_) {
+        data = null;
+      }
+      if (!data) return null;
+      const items = Array.isArray(data) ? data : data.results || data.data || [];
+      if (!Array.isArray(items)) return null;
+
+      const results = [];
+      const posterJobs = [];
+      for (const item of items) {
+        if (!item || typeof item !== "object") continue;
+        const route = String(item.path || item.url || "").match(
+          /\/(movies|series)\/([a-z0-9-]+)-download-(\d+)/i
+        );
+        if (!route) continue;
+        const mediaType = route[1].toLowerCase() === "series" ? "tv" : "movie";
+        let cover =
+          item.poster || item.image || item.poster_path || item.posterPath || "";
+        if (typeof cover === "string" && /^\/[\w/.-]+\.(?:jpe?g|png|webp)$/i.test(cover)) {
+          cover = `https://image.tmdb.org/t/p/w500${cover}`;
+        }
+        const entry = {
+          title:
+            this.cleanText(item.title || item.name || item.post_title || "") ||
+            this.prettifySlug(route[2]) ||
+            "XDMovies",
+          url: `/${route[1].toLowerCase()}/${route[2]}-download-${route[3]}`,
+          cover: cover ? this.resolveUrl(cover) : "",
+        };
+        results.push(entry);
+        const tmdbId = String(item.tmdb_id || item.tmdbId || "");
+        if (!entry.cover && /^\d+$/.test(tmdbId) && posterJobs.length < 12) {
+          posterJobs.push([entry, tmdbId, mediaType]);
+        }
+        if (results.length >= 24) break;
+      }
+      for (const [entry, id, mediaType] of posterJobs) {
+        entry.cover = await this.tmdbImage(id, mediaType);
+      }
+      return results;
+    } catch (_) {
+      return null;
+    }
+  }
+
   async detail(url) {
+    await this.ensureToken();
     const path = this.toPath(url);
     const html = await this.getPage(path);
     if (this.isBlockedPage(html)) {
@@ -133,6 +258,7 @@ export default class extends Extension {
   }
 
   async watch(url) {
+    await this.ensureToken();
     const packed = String(url || "");
 
     const pageMatch = packed.match(/^xd:page:(.+)$/i);
@@ -751,26 +877,41 @@ export default class extends Extension {
 
   // ---------- networking helpers ----------
 
-  // Page GET with a full browser header set. Cloudflare 403s the content
-  // pages for Miru's client fingerprint specifically (home/search pass),
-  // so on failure we first retry after a homepage warm-up, then route the
-  // same URL through public raw-HTML relays that fetch from their own
-  // infrastructure. Miru throws (Dio) on any >=400 — the underlying reason
-  // is kept in _lastError for the user-facing message.
+  // Page GET. For xdmovies hosts the same path is tried on the app's own
+  // host first (new.xdmovies.wtf + app-trust headers — the combination its
+  // official app uses), then directly. If both fail: one optional
+  // FlareSolverr call (real browser solve; its clearance cookies are cached
+  // and replayed for the rest of the session), then public raw-HTML relays.
+  // Miru throws (Dio) on any >=400 — the first observed reason is kept in
+  // _lastError for the user-facing message.
   async getPage(pathOrUrl) {
     const absolute = this.resolveUrl(pathOrUrl);
     this._lastError = "";
+    const relayBase = absolute.replace(/^(https):\/\/new\.(xdmovies\.wtf)/i, "$1://top.$2");
     const relayUrls = [
-      `https://api.allorigins.win/raw?url=${encodeURIComponent(absolute)}`,
-      `https://api.codetabs.com/v1/proxy?quest=${absolute}`,
-      `https://proxy.corsfix.com/?${absolute}`,
-      `https://api.cors.lol/?url=${encodeURIComponent(absolute)}`,
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(relayBase)}`,
+      `https://api.codetabs.com/v1/proxy?quest=${relayBase}`,
+      `https://proxy.corsfix.com/?${relayBase}`,
+      `https://api.cors.lol/?url=${encodeURIComponent(relayBase)}`,
     ];
+
+    // Direct candidates: for xdmovies paths try both site hosts.
+    const pathQuery = absolute.replace(/^https?:\/\/[^/]+/i, "") || "/";
+    const isXdm = /(^|\.)xdmovies\.wtf$/i.test(
+      (absolute.match(/^https?:\/\/([^/]+)/i) || [])[1] || ""
+    );
+    const directUrls = [];
+    if (isXdm) {
+      directUrls.push(`${API_URL}${pathQuery}`);
+      directUrls.push(`${SITE_URL}${pathQuery}`);
+    } else {
+      directUrls.push(absolute);
+    }
 
     const tryGet = async (target, extraHeaders = {}) => {
       try {
         const response = await this.request("", {
-          headers: { "Miru-Url": target, ...BROWSER_HEADERS, ...extraHeaders },
+          headers: { "Miru-Url": target, ...this.siteHeaders(target, extraHeaders) },
         });
         const body =
           typeof response === "string" ? response : JSON.stringify(response || "");
@@ -784,31 +925,78 @@ export default class extends Extension {
         };
       }
     };
+    const usable = (body) =>
+      !!body &&
+      (this.isBlockedPage(body) || (body.length >= 200 && !this.isDenyStub(body)));
 
     const reasons = [];
-    // Pass 1: direct, twice with a homepage warm-up in between (the shared
-    // cookie jar may pick up clearance cookies set on the front page).
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const got = await tryGet(absolute);
-      if (got.body && (this.isBlockedPage(got.body) || got.body.length >= 200)) {
-        return got.body;
+    let firstError = "";
+    const note = (r) => {
+      reasons.push(r.error || (r.body ? "deny stub" : "empty body"));
+      if (r.error && !firstError) firstError = r.error;
+    };
+    // Pass 1: direct candidates, twice, with a homepage warm-up in between.
+    for (let round = 0; round < 2; round += 1) {
+      for (const target of directUrls) {
+        const got = await tryGet(target);
+        if (usable(got.body)) return got.body;
+        note(got);
       }
-      reasons.push(got.error || "empty body");
-      if (attempt === 0) await tryGet(`${SITE_URL}/`);
+      if (round === 0) await tryGet(`${API_URL}/`).catch(() => {});
     }
 
-    // Pass 2: relays (their servers fetch the page, not the local client).
+    // Pass 2: optional FlareSolverr solve (user-configured local solver).
+    const solver = await this.getSettingSafe("xdmovies_solver_url");
+    if (/^https?:\/\//i.test(solver)) {
+      try {
+        const response = await this.request("", {
+          headers: { "Miru-Url": solver, "Content-Type": "application/json" },
+          method: "post",
+          data: JSON.stringify({
+            cmd: "request.get",
+            url: directUrls[directUrls.length - 1],
+            maxTimeout: 90000,
+          }),
+        });
+        const text = typeof response === "string" ? response : JSON.stringify(response || "");
+        const solved = JSON.parse(text);
+        const html = solved && solved.solution && solved.solution.response;
+        if (solved.status === "ok" && typeof html === "string" && html.length >= 200) {
+          const cookies = (solved.solution.cookies || [])
+            .map((c) => `${c.name}=${c.value}`)
+            .join("; ");
+          if (cookies) {
+            this._cfCookies = cookies;
+            this._cfUA = solved.solution.userAgent || "";
+          }
+          if (!this.isBlockedPage(html) && !this.isDenyStub(html)) return html;
+          reasons.push("solver passed a challenge page");
+        } else {
+          reasons.push("solver failed");
+        }
+      } catch (e) {
+        reasons.push("solver unreachable");
+      }
+    }
+
+    // Pass 3: relays (their servers fetch the page, not the local client).
     for (const relay of relayUrls) {
       const extra = relay.includes("corsfix") ? { Origin: "https://miru.local" } : {};
       const got = await tryGet(relay, extra);
-      if (got.body && !this.isRelayJunk(got.body) && got.body.length >= 200) {
+      if (got.body && !this.isRelayJunk(got.body) && !this.isDenyStub(got.body) && got.body.length >= 200) {
         return got.body;
       }
-      reasons.push(got.error || (got.body ? "relay rejected" : "relay empty"));
+      note(got);
     }
 
-    this._lastError = reasons.find(Boolean) || "";
+    this._lastError = firstError || reasons.find(Boolean) || "";
     return "";
+  }
+
+  // The site's tiny "keep out" bodies.
+  isDenyStub(body) {
+    const source = String(body || "");
+    return source.length < 4000 && /direct access not permitted|access denied/i.test(source);
   }
 
   // Error/rate-limit pages of the relay services themselves.
@@ -821,12 +1009,14 @@ export default class extends Extension {
 
   async fetchAbsolute(absoluteUrl, referer = SITE_URL) {
     try {
+      const target = this.resolveUrl(absoluteUrl);
       const response = await this.request("", {
         headers: {
-          "Miru-Url": this.resolveUrl(absoluteUrl),
-          ...BROWSER_HEADERS,
-          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          Referer: referer || `${SITE_URL}/`,
+          "Miru-Url": target,
+          ...this.siteHeaders(target, {
+            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            Referer: referer || `${API_URL}/`,
+          }),
         },
       });
       return this.text(response);
