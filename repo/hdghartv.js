@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         HDGharTV
-// @version      v0.1.4
+// @version      v0.1.5
 // @author       OshekharO
 // @lang         hi
 // @license      MIT
@@ -652,18 +652,25 @@ export default class extends Extension {
       const quality = this.cleanText(link.quality || "1080p");
       const tracks = this.parseAudioTracks(playlist, link.url);
 
-      if (tracks.length) {
-        for (const track of tracks) {
-          options.push({
-            name: `${label} · ${quality} · ${track.name}`.trim(),
-            url: this.packSource(link, track.url),
-          });
-        }
-      } else {
-        const language = this.languageFromLink(link);
+      // Always offer the plain stream first. Multi-audio HLS masters can be
+      // switched inside the player's own audio-track menu, and Miru opens a
+      // supplemental audio track WITHOUT the headers it uses for the main
+      // stream — a referer-protected CDN then rejects that fetch and aborts
+      // playback with ffmpeg errors like "tcp: ffurl_read returned ...".
+      // When dedicated per-language variants exist below, keep the plain
+      // entry's name free of a language suffix so the two don't collide.
+      const language = tracks.length ? "" : this.languageFromLink(link);
+      options.push({
+        name: `${label} · ${quality}${language ? ` · ${language}` : ""}`.trim(),
+        url: this.packSource(link),
+      });
+
+      // Dual-audio variants stay available as optional extras after the safe
+      // default, for sources whose audio CDN accepts header-less fetches.
+      for (const track of tracks) {
         options.push({
-          name: `${label} · ${quality}${language ? ` · ${language}` : ""}`.trim(),
-          url: this.packSource(link),
+          name: `${label} · ${quality} · ${track.name}`.trim(),
+          url: this.packSource(link, track.url),
         });
       }
     }
