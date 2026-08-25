@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         HDGharTV
-// @version      v0.0.6
+// @version      v0.0.9
 // @author       OshekharO
 // @lang         hi
 // @license      MIT
@@ -19,6 +19,10 @@ const USER_AGENT =
 export default class extends Extension {
   async latest(page = 1) {
     const pageNumber = Number(page) > 0 ? Number(page) : 1;
+    const sitePath = pageNumber > 1 ? `/page/${pageNumber}/` : "/";
+    const scraped = this.scrapeCatalog(await this.sitePage(sitePath));
+    if (scraped.length) return scraped;
+
     const endpoints = [
       `/movies/public?page=${pageNumber}&limit=24`,
       `/movies?page=${pageNumber}&limit=24`,
@@ -40,7 +44,17 @@ export default class extends Extension {
     const query = String(kw || "").trim();
     if (!query) return [];
 
-    const data = await this.api(`/search?q=${encodeURIComponent(query)}`);
+    const encoded = encodeURIComponent(query);
+    const sitePaths = [
+      `/search?q=${encoded}`,
+      `/?s=${encoded}`,
+    ];
+    for (const sitePath of sitePaths) {
+      const scraped = this.scrapeCatalog(await this.sitePage(sitePath));
+      if (scraped.length) return scraped;
+    }
+
+    const data = await this.api(`/search?q=${encoded}`);
     const items = [
       ...(Array.isArray(data && data.movies) ? data.movies : []).map((item) => ({
         ...item,
@@ -60,6 +74,10 @@ export default class extends Extension {
     if (!id || !/^(movie|series)$/.test(mediaType)) {
       throw new Error("HDGharTV: invalid catalogue item URL.");
     }
+
+    const pageUrl = `${SITE_URL}/${mediaType}/${encodeURIComponent(id)}`;
+    const scraped = this.scrapeDetail(await this.sitePage(pageUrl), pageUrl);
+    if (scraped && scraped.episodes.length) return scraped;
 
     const data = await this.api(
       `/${mediaType === "series" ? "series" : "movies"}/public/${encodeURIComponent(id)}`
@@ -119,6 +137,197 @@ export default class extends Extension {
     };
     if (audioTrack && !isMp4) result.audioTrack = audioTrack;
     return result;
+  }
+
+  async sitePage(url) {
+    try {
+      const response = await this.request("", {
+        headers: {
+          "Miru-Url": this.resolveUrl(url),
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          Referer: `${SITE_URL}/`,
+          "User-Agent": USER_AGENT,
+        },
+      });
+      return this.asText(response);
+    } catch (_) {
+      return "";
+    }
+  }
+
+  scrapeCatalog(html) {
+    const source = this.asText(html);
+    if (!source || /cloudflare|attention required/i.test(source)) return [];
+
+    const results = [];
+    const seen = new Set();
+    const anchorRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let match;
+    while ((match = anchorRegex.exec(source)) !== null) {
+      const href = this.decodeHtmlEntities(match[1]);
+      const route = href.match(/\/(movie|series)\/([^/?#"']+)/i);
+      if (!route) continue;
+
+      const openingTag = match[0].slice(0, match[0].indexOf(">") + 1);
+      const content = match[2];
+      const imageTag = content.match(/<img\b[^>]*>/i);
+      const title = this.cleanText(
+        this.htmlAttribute(openingTag, "oldtitle") ||
+          this.htmlAttribute(openingTag, "title") ||
+          this.htmlAttribute(openingTag, "aria-label") ||
+          this.htmlTagText(content, "h1|h2|h3|h4") ||
+          (imageTag && this.htmlAttribute(imageTag[0], "alt")) ||
+          ""
+      );
+      if (!title) continue;
+
+      const mediaType = route[1].toLowerCase() === "series" ? "series" : "movie";
+      const itemUrl = `${mediaType}:${this.decodeURIComponentSafe(route[2])}`;
+      if (seen.has(itemUrl)) continue;
+      seen.add(itemUrl);
+
+      const image = imageTag &&
+        (this.htmlAttribute(imageTag[0], "data-src") ||
+          this.htmlAttribute(imageTag[0], "src") ||
+          this.htmlAttribute(imageTag[0], "data-lazy-src"));
+      results.push({
+        title,
+        url: itemUrl,
+        cover: this.resolveUrl(this.decodeHtmlEntities(image || "")),
+      });
+    }
+
+    return results;
+  }
+
+  scrapeDetail(html, pageUrl) {
+    const source = this.asText(html);
+    if (!source || /cloudflare|attention required/i.test(source)) return null;
+
+    const title = this.cleanText(
+      this.htmlTagText(source, "h1") ||
+        this.htmlTagText(source, "h2") ||
+        this.htmlAttributeFromTag(source, "meta", "property", "og:title", "content") ||
+        this.htmlTagText(source, "title") ||
+        "HDGharTV"
+    );
+    const cover = this.resolveUrl(
+      this.decodeHtmlEntities(
+        this.htmlAttributeFromTag(source, "meta", "property", "og:image", "content") ||
+          this.htmlAttributeFromTag(source, "img", "itemprop", "image", "src") ||
+          this.htmlAttributeFromTag(source, "img", "", "", "data-src") ||
+          this.htmlAttributeFromTag(source, "img", "", "", "src") ||
+          ""
+      ),
+      pageUrl
+    );
+    const desc = this.cleanText(
+      this.htmlTagTextByClass(source, "p", "description|overview|plot|synopsis") || ""
+    );
+    const mediaUrls = this.extractMediaUrls(source).filter((url) =>
+      this.isWorkingQuality(url)
+    );
+    if (!mediaUrls.length) return null;
+
+    return {
+      title,
+      cover,
+      desc,
+      episodes: [
+        {
+          title: "HDGharTV",
+          urls: mediaUrls.map((mediaUrl, index) => ({
+            name: this.mediaQuality(mediaUrl) || `Server ${index + 1}`,
+            url: this.packSource({ url: mediaUrl }),
+          })),
+        },
+      ],
+    };
+  }
+
+  extractMediaUrls(value) {
+    const source = this.asText(value).replace(/\\\//g, "/");
+    const urls = [];
+    const seen = new Set();
+    const add = (candidate) => {
+      const url = this.normaliseUrl(candidate);
+      if (
+        !url ||
+        seen.has(url) ||
+        !/^https?:\/\//i.test(url) ||
+        !/(?:streamraiwind\.stream|\.(?:m3u8|mp4)(?:$|[?#]))/i.test(url)
+      ) {
+        return;
+      }
+      seen.add(url);
+      urls.push(url);
+    };
+
+    const urlRegex = /https?:\/\/[^"'<>\s]+/gi;
+    let match;
+    while ((match = urlRegex.exec(source)) !== null) add(match[0]);
+    return urls;
+  }
+
+  mediaQuality(url) {
+    const match = String(url || "").match(/(?:2160|1440|1080|720|480|360)p?/i);
+    return match ? (/[a-z]/i.test(match[0]) ? match[0] : `${match[0]}p`) : "";
+  }
+
+  htmlAttribute(tag, attribute) {
+    if (!tag) return "";
+    const match = String(tag).match(
+      new RegExp(`${attribute}\\s*=\\s*["']([^"']*)["']`, "i")
+    );
+    return match ? match[1] : "";
+  }
+
+  htmlTagText(html, tags) {
+    const match = String(html || "").match(
+      new RegExp(`<(${tags})\\b[^>]*>([\\s\\S]*?)<\\/\\1>`, "i")
+    );
+    return match ? this.cleanText(match[2]) : "";
+  }
+
+  htmlTagTextByClass(html, tag, classes) {
+    const match = String(html || "").match(
+      new RegExp(`<${tag}\\b[^>]*class=["'][^"']*(?:${classes})[^"']*["'][^>]*>([\\s\\S]*?)<\\/${tag}>`, "i")
+    );
+    return match ? this.cleanText(match[1]) : "";
+  }
+
+  htmlAttributeFromTag(html, tag, key, value, attribute) {
+    const tagRegex = key
+      ? new RegExp(`<${tag}\\b[^>]*${key}=["']${value}["'][^>]*>`, "i")
+      : new RegExp(`<${tag}\\b[^>]*>`, "i");
+    const match = String(html || "").match(tagRegex);
+    return match ? this.htmlAttribute(match[0], attribute || "content") : "";
+  }
+
+  decodeHtmlEntities(value) {
+    return String(value || "")
+      .replace(/&amp;/gi, "&")
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;|&apos;/gi, "'")
+      .replace(/&nbsp;/gi, " ");
+  }
+
+  cleanText(value) {
+    return this.decodeHtmlEntities(String(value || ""))
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  asText(value) {
+    if (typeof value === "string") return value;
+    try {
+      return JSON.stringify(value || "");
+    } catch (_) {
+      return String(value || "");
+    }
   }
 
   async api(path) {
@@ -265,8 +474,11 @@ export default class extends Extension {
   }
 
   isWorkingQuality(quality) {
-    // Keep this allow-list explicit so broken 480p/720p records never appear.
-    return /1080/i.test(String(quality || ""));
+    const value = String(quality || "");
+    // Keep broken lower-quality records out. Direct HLS URLs from the site
+    // often do not contain a resolution, so allow the known stream CDN too.
+    if (/(?:2160|1440|720|480|360|4k)/i.test(value)) return false;
+    return /1080|streamraiwind/i.test(value);
   }
 
   isHlsLink(link) {
@@ -502,10 +714,4 @@ export default class extends Extension {
       .replace(/&amp;/gi, "&");
   }
 
-  cleanText(value) {
-    return String(value || "")
-      .replace(/<[^>]+>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
 }
