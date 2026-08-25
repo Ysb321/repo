@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         XDMovies
-// @version      v0.0.1
+// @version      v0.0.2
 // @author       Ysb321
 // @lang         hi
 // @license      MIT
@@ -359,55 +359,136 @@ export default class extends Extension {
   async resolveDownload(pageUrl) {
     let currentUrl = this.resolveUrl(pageUrl);
 
-    for (let attempt = 0; attempt < 4 && currentUrl; attempt += 1) {
+    for (let attempt = 0; attempt < 5 && currentUrl; attempt += 1) {
+      // Plain-HTML pages we may safely GET. File/mirror links are never
+      // fetched — Dio buffers whole responses, so those are handed to the
+      // player directly (it streams them and supports resume).
+      const host = (currentUrl.match(/^https?:\/\/([^/]+)/i) || [])[1] || "";
+      const looksLikeFile =
+        /X-Amz-Signature|response-content-disposition|\.r2\.|storage\.googleapis\.com|pixeldrain\.|\/api\/file\/|\.(?:mkv|mp4|webm|m3u8|avi|mov|zip)(?:[?#%]|\s|"|$)/i.test(
+          currentUrl
+        );
+      if (looksLikeFile) {
+        return this.playable(
+          currentUrl,
+          /\.m3u8/i.test(currentUrl) ? "hls" : "mp4",
+          `${SITE_URL}/`
+        );
+      }
+
       const html = await this.fetchAbsolute(currentUrl, SITE_URL);
 
       const media = this.extractMediaUrls(html);
       if (media.length) return this.playable(media[0], "", currentUrl);
 
       if (
-        /turnstile|cf-chl|verify(?:ing)? you are|checking your browser|verify you are human|complete the (?:action|captcha)|timer paused|generate (?:your )?link/i.test(
+        /turnstile|cf-chl|verify(?:ing)? you are|checking your browser|verify you are human|complete the (?:action|captcha)|timer paused|get your link/i.test(
           html
         )
       ) {
         throw new Error(
-          "XDMovies: this link needs one-time browser verification (Cloudflare). Open it in your browser to reach the FSL/direct link, or use the Watch Online server."
+          "XDMovies: this short link needs one-time browser verification. Open it in your browser (HubCloud/FSL page loads there), or use the Watch Online server."
         );
       }
 
-      // Mirror buttons on a resolved download page. FSL mirrors are resumable
-      // direct links, so they are preferred for in-app playback/IDM resume.
-      let nextUrl = "";
-      const anchorRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-      const candidates = [];
-      let match;
-      while ((match = anchorRegex.exec(html)) !== null) {
-        const href = this.resolveUrl(this.decodeHtmlEntities(match[1]), currentUrl);
-        const text = this.cleanText(match[2]);
-        if (!/^https?:\/\//i.test(href) || /xdmovies\.wtf|latestnewsonline\./i.test(href)) {
-          continue;
+      // HubCloud drive page: jump to the generated mirror list.
+      if (!/hubcloud\.php\?/i.test(currentUrl)) {
+        const generate = html.match(
+          /<a\b[^>]*href=["']([^"']*(?:hubcloud\.php\?[^"']*|drive\/dl\?[^"']*)[^"']*)["'][^>]*>([\s\S]*?)<\/a>/i
+        );
+        if (generate && /generate|direct download/i.test(this.cleanText(generate[2]))) {
+          const next = this.resolveUrl(this.decodeHtmlEntities(generate[1]), currentUrl);
+          if (/hubcloud\.php\?/i.test(next)) {
+            currentUrl = next;
+            continue;
+          }
         }
-        const weight = /fsl/i.test(`${href} ${text}`)
-          ? 0
-          : /instant|resume|direct|ddl|download now|go to link|continue/i.test(text)
-            ? 1
-            : /drive|cloud|hubcloud|filemoon|streamwish|gdflix|vcloud|gofile|hubdrive/i.test(
-                  `${href} ${text}`
-                )
-              ? 2
-              : 3;
-        candidates.push({ href, text, weight });
       }
-      candidates.sort((a, b) => a.weight - b.weight);
-      nextUrl = candidates.length ? candidates[0].href : "";
 
-      if (!nextUrl || nextUrl === currentUrl) break;
-      currentUrl = nextUrl;
+      // Generated mirror page: every labelled server button links straight to
+      // a resumable direct file (FSL/FSLv2 -> R2 presigned URLs, Pixeldrain,
+      // S3, ZipDisk...). Pick by preference and return WITHOUT fetching it.
+      const mirror = this.pickMirror(html, currentUrl);
+      if (mirror) {
+        return this.playable(
+          mirror.url,
+          /\.m3u8/i.test(mirror.url) ? "hls" : "mp4",
+          currentUrl
+        );
+      }
+
+      // Fallback: first plausible external anchor that isn't a promo/gate.
+      const fallback = this.firstExternalAnchor(html, currentUrl);
+      if (fallback && fallback !== currentUrl) {
+        currentUrl = fallback;
+        continue;
+      }
+      break;
     }
 
     throw new Error(
       "XDMovies: couldn't reach a playable FSL/direct link. The mirror steps may require a browser."
     );
+  }
+
+  pickMirror(html, pageUrl) {
+    const source = String(html || "");
+    const candidates = [];
+    const seen = new Set();
+    const anchorRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let match;
+    while ((match = anchorRegex.exec(source)) !== null) {
+      const href = this.resolveUrl(this.decodeHtmlEntities(match[1]), pageUrl);
+      const text = this.cleanText(match[2]);
+      if (!/^https?:\/\//i.test(href) || seen.has(href)) continue;
+      seen.add(href);
+
+      let weight = -1;
+      let finalHref = href;
+      if (/FSL\s*v?2/i.test(text)) weight = 0;
+      else if (/FSL\s*Server/i.test(text)) weight = 1;
+      else if (/pixeldra|pixel/i.test(text)) {
+        weight = 2;
+        finalHref = this.pixeldrainDirect(href);
+      } else if (/S3\s*Server/i.test(text)) weight = 3;
+      else if (/^\s*Download\s+(File|Now|\[?\s*File)/i.test(text) || /Download\s*\[?\s*File\s*Server/i.test(text)) weight = 4;
+      else if (/ZipDisk/i.test(text)) weight = 5;
+      else if (/Mega\s*Server/i.test(text)) weight = 6;
+      else if (/10\s*Gbps|Server\s*:/i.test(text)) weight = 7;
+      else if (/BuzzServer/i.test(text)) continue; // needs hx-redirect headers Miru can't read
+      else if (/download|server|resume|direct/i.test(text) &&
+        !/t\.me|tinyurl|one\.one\.one|google\.com|xdmovies|hubcloud\.(?:foo|cx|boats|top)|gamerxyt\.com/i.test(href)) weight = 8;
+      else continue;
+
+      candidates.push({ weight, url: finalHref, text });
+    }
+
+    candidates.sort((a, b) => a.weight - b.weight);
+    return candidates.length ? candidates[0] : null;
+  }
+
+  pixeldrainDirect(url) {
+    const value = String(url || "");
+    if (/\/api\/file\//i.test(value)) return value;
+    const m = value.match(/pixeldrain\.(?:com|dev)\/u\/([A-Za-z0-9]+)/i);
+    if (m) return `https://pixeldrain.com/api/file/${m[1]}?download`;
+    return value;
+  }
+
+  firstExternalAnchor(html, pageUrl) {
+    const source = String(html || "");
+    const anchorRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>[\s\S]*?<\/a>/gi;
+    let match;
+    while ((match = anchorRegex.exec(source)) !== null) {
+      const href = this.resolveUrl(this.decodeHtmlEntities(match[1]), pageUrl);
+      if (
+        /^https?:\/\//i.test(href) &&
+        !/t\.me|tinyurl|one\.one\.one|google\.com|youtube|youtu\.be|facebook|twitter|instagram|discord|xdmovies|latestnewsonline\.|hdhub4u/i.test(href)
+      ) {
+        return href;
+      }
+    }
+    return "";
   }
 
   extractMediaUrls(value) {
