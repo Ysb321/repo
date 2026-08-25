@@ -509,6 +509,19 @@
   "webSite": "https://afilmyhub.mom"
  },
  {
+  "author": "Ysb321",
+  "icon": "https://img.iwebp.store/images/files/afaa901b76bc48d57a346319423035dd384208.png",
+  "lang": "hi",
+  "license": "MIT",
+  "name": "FilmyFly",
+  "nsfw": "false",
+  "package": "filmyfly.farm",
+  "type": "bangumi",
+  "url": "filmyfly.farm.js",
+  "version": "v0.0.1",
+  "webSite": "https://filmyfly.green"
+ },
+ {
   "author": "appdevelpo",
   "icon": "https://111.90.140.97/wp-content/uploads/2022/09/Fliz-Hindi-Movie-Website-02.jpg",
   "lang": "hi",
