@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         HDGharTV
-// @version      v0.0.3
+// @version      v0.0.4
 // @author       OshekharO
 // @lang         hi
 // @license      MIT
@@ -187,12 +187,8 @@ export default class extends Extension {
 
   async movieEpisodes(data, title) {
     const links = this.activeLinks(data && data.streamingLinks);
-    return [
-      {
-        title: "HDGharTV",
-        urls: await this.linkOptions(links, title),
-      },
-    ];
+    const urls = await this.linkOptions(links, title);
+    return urls.length ? [{ title: "HDGharTV", urls }] : [];
   }
 
   async seriesEpisodes(data) {
@@ -232,45 +228,30 @@ export default class extends Extension {
 
   async linkOptions(links, label) {
     const options = [];
-    const preferred = this.preferredLink(links);
-    const preferredPlaylist = preferred && this.isHlsLink(preferred)
-      ? await this.fetchPlaylist(preferred.url)
-      : "";
-    const preferredIsPlayable = this.isPlaylist(preferredPlaylist);
 
     for (const link of links || []) {
-      let sourceLink = link;
-      let playlist = this.isHlsLink(link)
-        ? await this.fetchPlaylist(link.url)
-        : "";
+      const hls = this.isHlsLink(link);
+      const playlist = hls ? await this.fetchPlaylist(link.url) : "";
 
-      // A few HDGharTV entries expose stale 720p/480p URLs even though the
-      // 1080p master is valid. Keep the quality option usable by falling back
-      // to that master; the label makes the fallback visible to the user.
-      const staleHls = this.isHlsLink(link) && !this.isPlaylist(playlist);
-      if (staleHls && preferredIsPlayable && preferred.url !== link.url) {
-        sourceLink = preferred;
-        playlist = preferredPlaylist;
-      }
+      // Do not expose links that the CDN no longer serves. In particular,
+      // HDGharTV sometimes leaves stale 480p/720p records in its API.
+      if (hls && !this.isPlaylist(playlist)) continue;
 
       const quality = this.cleanText(link.quality || "HD");
-      const fallbackLabel = sourceLink === link
-        ? quality
-        : `${quality} (fallback ${this.cleanText(sourceLink.quality || "HD")})`;
-      const tracks = this.parseAudioTracks(playlist, sourceLink.url);
+      const tracks = await this.parseAudioTracks(playlist, link.url);
 
       if (tracks.length) {
         for (const track of tracks) {
           options.push({
-            name: `${label} · ${fallbackLabel} · ${track.name}`.trim(),
-            url: this.packSource(sourceLink, track.url),
+            name: `${label} · ${quality} · ${track.name}`.trim(),
+            url: this.packSource(link, track.url),
           });
         }
       } else {
-        const language = this.languageFromLink(sourceLink);
+        const language = this.languageFromLink(link);
         options.push({
-          name: `${label} · ${fallbackLabel}${language ? ` · ${language}` : ""}`.trim(),
-          url: this.packSource(sourceLink),
+          name: `${label} · ${quality}${language ? ` · ${language}` : ""}`.trim(),
+          url: this.packSource(link),
         });
       }
     }
@@ -285,16 +266,6 @@ export default class extends Extension {
     );
   }
 
-  preferredLink(links) {
-    return (links || []).slice().sort((a, b) => {
-      const quality = (link) => {
-        const match = String(link && link.quality || "").match(/(\d{3,4})/);
-        return match ? Number(match[1]) : 0;
-      };
-      return quality(b) - quality(a);
-    })[0];
-  }
-
   isHlsLink(link) {
     const type = String(link && link.type || "").toLowerCase();
     return /hls|m3u8/.test(type) || /\.m3u8(?:$|[?#])/i.test(link && link.url || "");
@@ -304,7 +275,7 @@ export default class extends Extension {
     return /#EXTM3U/i.test(String(value || ""));
   }
 
-  parseAudioTracks(playlist, baseUrl) {
+  async parseAudioTracks(playlist, baseUrl) {
     if (!this.isPlaylist(playlist)) return [];
 
     const tracks = [];
@@ -324,6 +295,13 @@ export default class extends Extension {
         "Audio";
       const trackUrl = this.resolveUrl(uri, baseUrl);
       if (!trackUrl || seen.has(trackUrl)) continue;
+
+      // A master playlist can retain an audio entry whose signed URL has
+      // expired. Check the audio playlist too, otherwise Miru would show a
+      // language option that cannot play.
+      const trackPlaylist = await this.fetchPlaylist(trackUrl);
+      if (!this.isPlaylist(trackPlaylist)) continue;
+
       seen.add(trackUrl);
       tracks.push({
         name: this.cleanText(name || "Audio"),
