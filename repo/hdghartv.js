@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         HDGharTV
-// @version      v0.1.2
+// @version      v0.1.3
 // @author       OshekharO
 // @lang         hi
 // @license      MIT
@@ -473,32 +473,29 @@ export default class extends Extension {
     if (!data || typeof data !== "object") return [];
 
     const payload = data.data && typeof data.data === "object" ? data.data : data;
-    return [
-      ...(Array.isArray(payload.movies) ? payload.movies : []).map((item) => ({
-        ...item,
-        mediaType: "movie",
-      })),
-      ...(Array.isArray(payload.series) ? payload.series : []).map((item) => ({
-        ...item,
-        mediaType: "series",
-      })),
-      ...(Array.isArray(payload.results) ? payload.results : []).map((item) => ({
+    const tagged = (items, mediaType) =>
+      (Array.isArray(items) ? items : []).map((item) => ({ ...item, mediaType }));
+    const typed = (items) =>
+      (Array.isArray(items) ? items : []).map((item) => ({
         ...item,
         mediaType: /series|tv/i.test(String(item && (item.type || item.mediaType)))
           ? "series"
           : "movie",
-      })),
+      }));
+
+    return [
+      ...tagged(payload.movies, "movie"),
+      ...tagged(payload.series, "series"),
+      ...typed(payload.results),
+      ...typed(payload.items),
     ];
   }
 
   catalogItems(data) {
-    if (Array.isArray(data)) return data;
-    if (!data || typeof data !== "object") return [];
-    const payload = data.data && typeof data.data === "object" ? data.data : data;
-    for (const key of ["movies", "series", "results", "items"]) {
-      if (Array.isArray(payload[key])) return payload[key];
-    }
-    return [];
+    // The catalogue endpoints can return several lists (movies, series,
+    // results, items). Return all of them — not just the first one — so the
+    // home catalogue shows both movies and series.
+    return this.searchItems(data);
   }
 
   async toSearchResults(items) {
