@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         HDGharTV
-// @version      v0.1.5
+// @version      v0.1.3
 // @author       OshekharO
 // @lang         hi
 // @license      MIT
@@ -20,12 +20,11 @@ export default class extends Extension {
   async latest(page = 1) {
     const pageNumber = Number(page) > 0 ? Number(page) : 1;
     const sitePath = pageNumber > 1 ? `/page/${pageNumber}/` : "/";
-    const scraped = await this.scrapeCatalog(await this.sitePage(sitePath));
+    const scraped = this.scrapeCatalog(await this.sitePage(sitePath));
     if (scraped.length) return scraped;
 
     const endpoints = [
       `/movies/public?page=${pageNumber}&limit=24`,
-      `/home?page=${pageNumber}&limit=24`,
       `/movies?page=${pageNumber}&limit=24`,
       `/trending?page=${pageNumber}&limit=24`,
     ];
@@ -51,7 +50,7 @@ export default class extends Extension {
       `/?s=${encoded}`,
     ];
     for (const sitePath of sitePaths) {
-      const scraped = await this.scrapeCatalog(await this.sitePage(sitePath));
+      const scraped = this.scrapeCatalog(await this.sitePage(sitePath));
       if (scraped.length) return scraped;
     }
 
@@ -198,12 +197,12 @@ export default class extends Extension {
 
   isBlockedPage(value) {
     const source = this.asText(value);
-    return /attention required!|sorry,?\s+you have been blocked|you are unable to access|just a moment|verify(?:ing)? you are human|cf-chl|challenge-platform|challenge-error-text|needs to review the security of your connection|enable javascript and cookies to continue/i.test(
+    return /attention required!\s*\|\s*cloudflare|sorry,?\s+you have been blocked|you are unable to access hdghartv\.cc/i.test(
       source
     );
   }
 
-  async scrapeCatalog(html) {
+  scrapeCatalog(html) {
     const source = this.asText(html);
     if (!source || this.isBlockedPage(source)) return [];
 
@@ -245,64 +244,7 @@ export default class extends Extension {
       });
     }
 
-    if (results.length) return results;
-
-    // Falling back: the site renders its catalogue with JavaScript, so plain
-    // /movie//series/ anchors may be absent even though the page data is
-    // embedded in the document (Next.js __NEXT_DATA__ or JSON script tags).
-    return await this.toSearchResults(this.extractEmbeddedItems(source));
-  }
-
-  extractEmbeddedItems(html) {
-    const source = this.asText(html);
-    const jsonDocs = [];
-
-    const nextData = source.match(
-      /<script\b[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i
-    );
-    if (nextData) jsonDocs.push(nextData[1]);
-
-    const jsonScriptRegex =
-      /<script\b[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/gi;
-    let scriptMatch;
-    while ((scriptMatch = jsonScriptRegex.exec(source)) !== null) {
-      jsonDocs.push(scriptMatch[1]);
-    }
-
-    const queue = [];
-    for (const raw of jsonDocs) {
-      try {
-        const parsed = JSON.parse(this.decodeHtmlEntities(String(raw)).trim());
-        if (parsed && typeof parsed === "object") queue.push(parsed);
-      } catch (_) {
-        // Not a JSON document — ignore it.
-      }
-    }
-
-    const items = [];
-    const visited = new Set();
-    let budget = 4000;
-    while (queue.length && budget > 0) {
-      budget -= 1;
-      const node = queue.shift();
-      if (!node || typeof node !== "object" || visited.has(node)) continue;
-      visited.add(node);
-
-      // Bare arrays are reached again via their parent's named key (movies,
-      // series, results...), which carries the correct media type. Walking a
-      // raw array here would re-add items with a guessed (wrong) type.
-      if (!Array.isArray(node)) {
-        const found = this.searchItems(node);
-        for (const item of found) items.push(item);
-      }
-
-      for (const value of Object.values(node)) {
-        if (value && typeof value === "object" && !visited.has(value)) {
-          queue.push(value);
-        }
-      }
-    }
-    return items;
+    return results;
   }
 
   scrapeDetail(html, pageUrl) {
@@ -380,9 +322,6 @@ export default class extends Extension {
         !url ||
         seen.has(url) ||
         !/^https?:\/\//i.test(url) ||
-        // Posters often live on the same CDN host as the streams (e.g.
-        // img1.streamraiwind.stream). Never offer an image as a stream.
-        /\.(?:jpe?g|png|webp|avif|gif|svg|ico)(?:$|[?#])/i.test(url) ||
         !/(?:streamraiwind\.stream|\.(?:m3u8|mp4)(?:$|[?#]))/i.test(url)
       ) {
         return;
@@ -549,12 +488,6 @@ export default class extends Extension {
       ...tagged(payload.series, "series"),
       ...typed(payload.results),
       ...typed(payload.items),
-      ...typed(payload.trending),
-      ...typed(payload.latest),
-      ...typed(payload.popular),
-      ...typed(payload.featured),
-      ...typed(payload.list),
-      ...typed(payload.records),
     ];
   }
 
@@ -570,7 +503,7 @@ export default class extends Extension {
     const seen = new Set();
 
     for (const item of items || []) {
-      const id = item && (item._id || item.id || item.slug);
+      const id = item && (item._id || item.id);
       const title = this.cleanText(item && (item.title || item.name));
       const mediaType = item && item.mediaType === "series" ? "series" : "movie";
       if (!id || !title) continue;
@@ -652,25 +585,18 @@ export default class extends Extension {
       const quality = this.cleanText(link.quality || "1080p");
       const tracks = this.parseAudioTracks(playlist, link.url);
 
-      // Always offer the plain stream first. Multi-audio HLS masters can be
-      // switched inside the player's own audio-track menu, and Miru opens a
-      // supplemental audio track WITHOUT the headers it uses for the main
-      // stream — a referer-protected CDN then rejects that fetch and aborts
-      // playback with ffmpeg errors like "tcp: ffurl_read returned ...".
-      // When dedicated per-language variants exist below, keep the plain
-      // entry's name free of a language suffix so the two don't collide.
-      const language = tracks.length ? "" : this.languageFromLink(link);
-      options.push({
-        name: `${label} · ${quality}${language ? ` · ${language}` : ""}`.trim(),
-        url: this.packSource(link),
-      });
-
-      // Dual-audio variants stay available as optional extras after the safe
-      // default, for sources whose audio CDN accepts header-less fetches.
-      for (const track of tracks) {
+      if (tracks.length) {
+        for (const track of tracks) {
+          options.push({
+            name: `${label} · ${quality} · ${track.name}`.trim(),
+            url: this.packSource(link, track.url),
+          });
+        }
+      } else {
+        const language = this.languageFromLink(link);
         options.push({
-          name: `${label} · ${quality} · ${track.name}`.trim(),
-          url: this.packSource(link, track.url),
+          name: `${label} · ${quality}${language ? ` · ${language}` : ""}`.trim(),
+          url: this.packSource(link),
         });
       }
     }

@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         FilmyFly
-// @version      v0.0.1
+// @version      v0.0.2
 // @author       Ysb321
 // @lang         hi
 // @license      MIT
@@ -16,6 +16,10 @@
 // filesdl.in/cloud|drive/<id> -> direct fast .mkv servers + HubCloud/
 // Pixeldrain mirrors. Every link at every stage is surfaced as its own
 // tappable entry.
+// v0.0.2: one channel per quality, one entry per server; server links are
+// re-extracted fresh at play time (their tokens expire); media URLs are
+// percent-encoded the way browsers do (mpv/ffmpeg cannot send raw spaces)
+// and get browser-true origin Referers instead of an Origin header.
 
 const SITE_URL = "https://filmyfly.green";
 const USER_AGENT =
@@ -98,18 +102,23 @@ export default class extends Extension {
     const episodes = [];
 
     // Every "download" anchor on the title page (one linkmake.in/view link
-    // per release/part). Each view page is expanded at detail time so all
-    // qualities are directly visible and tappable.
+    // per release/part). Each view page is expanded at detail time so every
+    // quality AND every server is directly visible and tappable: one
+    // channel per quality, one entry per server.
     const views = this.collectViewLinks(html, path);
+    const multi = views.length > 1;
     for (const view of views.slice(0, 4)) {
-      const expanded = await this.expandView(view.url, view.label);
-      if (expanded.urls.length) {
-        episodes.push(expanded);
+      const groups = await this.expandView(view.url, view.label, multi);
+      if (groups.length) {
+        for (const group of groups) {
+          if (episodes.length >= 24) break;
+          episodes.push(group);
+        }
       } else {
         // Keep the link visible even if expansion failed.
         episodes.push({
           title: view.label || "Download Links",
-          urls: [{ name: "Open quality list", url: `xd:file:${encodeURIComponent(view.url)}` }],
+          urls: [{ name: "Open quality list", url: `ff:file:${encodeURIComponent(view.url)}` }],
         });
       }
     }
@@ -130,6 +139,16 @@ export default class extends Extension {
   async watch(url) {
     const packed = String(url || "");
 
+    const srvMatch = packed.match(/^ff:srv:(.+)$/i);
+    if (srvMatch) {
+      let payload = null;
+      try {
+        payload = JSON.parse(this.decodeURIComponentSafe(srvMatch[1]));
+      } catch (_) {}
+      if (payload && payload.u) return this.resolveServer(payload);
+      throw new Error("FilmyFly: invalid source URL.");
+    }
+
     const fileMatch = packed.match(/^ff:file:(.+)$/i);
     if (fileMatch) {
       return this.resolveChain(this.decodeURIComponentSafe(fileMatch[1]));
@@ -144,6 +163,112 @@ export default class extends Extension {
     }
 
     throw new Error("FilmyFly: invalid source URL.");
+  }
+
+  // ---------- server entries ----------
+
+  packServer(url, pageUrl, label) {
+    return `ff:srv:${encodeURIComponent(JSON.stringify({ u: url, p: pageUrl, n: label }))}`;
+  }
+
+  // Name the real host behind an anchor; "" means "not a usable server".
+  serverLabel(text, url) {
+    const source = `${String(text || "")} ${String(url || "")}`;
+    if (/slowcloud/i.test(source)) return "";
+    if (/filesdl\.[a-z.]+\/?(?:[?#]|$)/i.test(url)) return "";
+    if (/\/(?:login|signin|signup|register|dmca|policy|privacy|contact|terms|report|faq)(?:\.html|\.php)?\/?(?:[?#]|$)/i.test(url)) return "";
+    if (/linkmake\.in/i.test(url)) return "";
+    if (/gofile\.io/i.test(source)) return "GoFile (browser only)";
+    if (/gdflix/i.test(source)) return "GDFLIX (browser only)";
+    if (/buzz|fuckingfast/i.test(source)) return "Buzz (browser only)";
+    if (/10\s?gbps|zdownload\.php/i.test(source)) return "10Gbps Direct";
+    if (/cloud direct|fast cloud|aws[a-z_]*stor/i.test(source)) return "Cloud Direct (fast)";
+    if (/hubcloud|hubdrive|hubcdn|gamerxyt/i.test(source)) return "HubCloud";
+    if (/pixeldra|\/u\/[A-Za-z0-9_-]+\?download/i.test(source)) return "Pixeldrain";
+    if (this.looksLikeFile(url)) return "Direct file";
+    return "";
+  }
+
+  // Fetch one filesdl cloud/drive page at detail time and turn every real
+  // server anchor into its own entry.
+  async expandServerPage(pageUrl) {
+    if (!/filesdl\.[a-z.]+\/(?:cloud|drive)\//i.test(pageUrl)) return [];
+    const html = await this.getPage(pageUrl);
+    if (!html || this.isBlockedPage(html)) return [];
+    const entries = [];
+    const seen = new Set();
+    const anchorRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let match;
+    while ((match = anchorRegex.exec(html)) !== null) {
+      const url = this.resolveUrl(this.decodeHtmlEntities(match[1]), pageUrl);
+      const text = this.cleanText(match[2]);
+      if (!/^https?:\/\//i.test(url) || seen.has(url) || PROMO_HOSTS.test(url)) continue;
+      const label = this.serverLabel(text, url);
+      if (!label) continue;
+      seen.add(url);
+      entries.push({ name: label, url: this.packServer(url, pageUrl, label) });
+    }
+    return entries;
+  }
+
+  // Find the fresh href of one named server on a just-fetched page.
+  findServerAnchor(html, pageUrl, hint, stored) {
+    const want = String(hint || "").toLowerCase().trim();
+    const storedHost = (String(stored || "").match(/^https?:\/\/([^/]+)/i) || [])[1] || "";
+    let hostFallback = null;
+    const anchorRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let match;
+    while ((match = anchorRegex.exec(html)) !== null) {
+      const url = this.resolveUrl(this.decodeHtmlEntities(match[1]), pageUrl);
+      const text = this.cleanText(match[2]);
+      if (!/^https?:\/\//i.test(url) || PROMO_HOSTS.test(url)) continue;
+      const label = this.serverLabel(text, url);
+      if (!label) continue;
+      const host = ((url.match(/^https?:\/\/([^/]+)/i) || [])[1] || "").toLowerCase();
+      if (!hostFallback && storedHost && host && host === storedHost.toLowerCase()) {
+        hostFallback = { url, label };
+      }
+      if (want && label.toLowerCase() === want) return { url, label };
+    }
+    return hostFallback;
+  }
+
+  // Play one specific server entry. Its filesdl page is refetched at play
+  // time so short-lived token links are always fresh; falls back to the
+  // page's best server, then to the link captured at detail time.
+  async resolveServer(payload) {
+    const hint = String(payload.n || "");
+    const pageUrl = String(payload.p || "");
+    const stored = String(payload.u || "");
+
+    if (/\(browser only\)/i.test(hint) || /gofile\.io|fuckingfast\.net|gdflix/i.test(stored)) {
+      throw new Error(
+        "FilmyFly: this mirror only works in a real browser. Pick Cloud Direct, 10Gbps, Pixeldrain or HubCloud instead."
+      );
+    }
+
+    if (pageUrl) {
+      const html = await this.getPage(pageUrl);
+      if (html && !this.isBlockedPage(html)) {
+        const base = this.pageBaseUrl(html, pageUrl);
+        const anchor = this.findServerAnchor(html, pageUrl, hint, stored);
+        if (anchor) {
+          if (this.isArchive(anchor.url)) {
+            throw new Error("FilmyFly: this server offers a ZIP archive — pick another server.");
+          }
+          if (this.looksLikeFile(anchor.url)) {
+            return this.playable(anchor.url, this.mediaTypeHint(anchor.url), base);
+          }
+          return this.resolveChain(anchor.url, { referer: base });
+        }
+        // Server renamed/removed: fall back to the page's best playable link.
+        const best = this.pickDirect(html, pageUrl);
+        if (best) return best;
+      }
+    }
+
+    if (stored) return this.resolveChain(stored, { referer: pageUrl || SITE_URL });
+    throw new Error("FilmyFly: no playable server responded. Pick another server.");
   }
 
   // ---------- catalogue ----------
@@ -336,12 +461,13 @@ export default class extends Extension {
     return text.replace(/^download\s*/i, "").trim().slice(0, 120) || "Download";
   }
 
-  // Fetch one linkmake view page and turn every quality anchor into an
-  // entry. The raw HTML is server-rendered; the miner below also catches
-  // script-injected variants.
-  async expandView(viewUrl, label) {
+  // Fetch one linkmake view page, then every quality's filesdl page, and
+  // surface EVERY server link as its own entry. Returns one channel per
+  // quality ("480p-HEVC · 630Mb") holding an Auto entry plus one entry per
+  // real server on that quality's page.
+  async expandView(viewUrl, label, multi = false) {
     const html = await this.getPage(viewUrl);
-    const entries = [];
+    const qualities = [];
     const seen = new Set();
 
     const anchorRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
@@ -350,13 +476,18 @@ export default class extends Extension {
       const url = this.resolveUrl(this.decodeHtmlEntities(match[1]), viewUrl);
       const text = this.cleanText(match[2]);
       if (!/^https?:\/\//i.test(url) || seen.has(url) || PROMO_HOSTS.test(url)) continue;
-      const entry = this.hostEntry(url, text);
-      if (!entry) continue;
-      seen.add(entry.url);
-      entries.push(entry);
+      if (
+        !/filesdl\.[a-z.]+\/(?:cloud|drive)\//i.test(url) &&
+        !/hubcloud\.[a-z.]+/i.test(url) &&
+        !this.looksLikeFile(url)
+      ) {
+        continue;
+      }
+      seen.add(url);
+      qualities.push({ name: this.entryName(text, url), url });
     }
 
-    if (!entries.length) {
+    if (!qualities.length) {
       // Fallback: plain URL strings anywhere (data-attrs/scripts).
       const urlRegex =
         /https?:\/\/[\w.-]*filesdl[\w.-]*\/(?:cloud|drive)\/[A-Za-z0-9_\-]+|https?:\/\/hubcloud\.[a-z.]+\/(?:drive|file)\/[A-Za-z0-9_\-?=&]+/gi;
@@ -366,26 +497,54 @@ export default class extends Extension {
         const url = this.normaliseUrl(m[0]);
         if (seen.has(url)) continue;
         seen.add(url);
-        entries.push({ name: `Mirror ${entries.length + 1}`, url: `xd:file:${encodeURIComponent(url)}` });
+        qualities.push({ name: `Mirror ${qualities.length + 1}`, url });
       }
     }
 
-    for (const e of entries) {
-      if (e.url.startsWith("xd:file:")) e.url = `ff:file:${e.url.slice("xd:file:".length)}`;
+    const groups = [];
+    const maxServerFetches = 6;
+    for (let i = 0; i < qualities.length && groups.length < 12; i += 1) {
+      const quality = qualities[i];
+      const urls = [
+        { name: "Auto (best server)", url: `ff:file:${encodeURIComponent(quality.url)}` },
+      ];
+      if (i < maxServerFetches) {
+        let servers = [];
+        try {
+          servers = await this.expandServerPage(quality.url);
+        } catch (_) {}
+        for (const server of servers) urls.push(server);
+      }
+      const title =
+        quality.name && multi
+          ? `${quality.name} — ${label}`
+          : quality.name || label || "Download Links";
+      groups.push({ title, urls });
     }
-    return { title: label || "Download Links", urls: entries };
+    return groups;
   }
 
   // ---------- playback resolution ----------
 
-  async resolveChain(pageUrl) {
+  async resolveChain(pageUrl, opts = {}) {
     let currentUrl = this.resolveUrl(pageUrl);
+    let referer = this.pageBaseUrl("", opts.referer || SITE_URL);
 
     for (let attempt = 0; attempt < 6 && currentUrl; attempt += 1) {
+      // Browser-only mirrors: fail fast with a useful message.
+      if (/gofile\.io\/d\/|fuckingfast\.net|gdflix/i.test(currentUrl)) {
+        throw new Error(
+          "FilmyFly: this mirror only works in a real browser. Pick Cloud Direct, 10Gbps, Pixeldrain or HubCloud instead."
+        );
+      }
+      // Archives can't play in the video player.
+      if (this.isArchive(currentUrl)) {
+        throw new Error("FilmyFly: this server offers a ZIP archive — pick another server.");
+      }
       // Never let Dio fetch a real file body (it buffers everything). Any
       // file-shaped URL goes straight to the player.
       if (this.looksLikeFile(currentUrl)) {
-        return this.playable(currentUrl, /\.m3u8/i.test(currentUrl) ? "hls" : "mp4", currentUrl);
+        return this.playable(currentUrl, this.mediaTypeHint(currentUrl), referer);
       }
 
       const html = await this.getPage(currentUrl);
@@ -402,6 +561,7 @@ export default class extends Extension {
 
       const next = this.pickNext(html, currentUrl);
       if (next && next !== currentUrl) {
+        referer = this.pageBaseUrl(html, currentUrl);
         currentUrl = next;
         continue;
       }
@@ -415,6 +575,7 @@ export default class extends Extension {
 
   // Choose the best definitely-playable URL on a mirror/filesdl page.
   pickDirect(html, pageUrl) {
+    const base = this.pageBaseUrl(html, pageUrl);
     const links = [];
     const anchorRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
     let match;
@@ -426,14 +587,16 @@ export default class extends Extension {
 
     // 1. Fast direct file CDNs (awsastorge8 "Cloud/Fast Cloud", 10Gbps).
     for (const link of links) {
-      if (this.looksLikeFile(link.url) && /awsastor|awsstor|fffast|10gbps|cloud|fast|direct/i.test(link.url + " " + link.text)) {
-        return this.playable(link.url, /\.m3u8/i.test(link.url) ? "hls" : "mp4", pageUrl);
+      if (this.isArchive(link.url)) continue;
+      if (this.looksLikeFile(link.url) && /awsastor|awsstor|aws_[a-z]*stor|fffast|10gbps|cloud|fast|direct/i.test(link.url + " " + link.text)) {
+        return this.playable(link.url, this.mediaTypeHint(link.url), base);
       }
     }
     // 2. Any file-shaped anchor at all.
     for (const link of links) {
+      if (this.isArchive(link.url)) continue;
       if (this.looksLikeFile(link.url) && !PROMO_HOSTS.test(link.url)) {
-        return this.playable(link.url, /\.m3u8/i.test(link.url) ? "hls" : "mp4", pageUrl);
+        return this.playable(link.url, this.mediaTypeHint(link.url), base);
       }
     }
     // 3. Genuine pixeldrain /u/ links -> direct api download URL. (Mirror
@@ -441,17 +604,17 @@ export default class extends Extension {
     for (const link of links) {
       const pd = link.url.match(/pixeldrain\.(?:com|dev)\/u\/([A-Za-z0-9_-]+)(?:\?download)?$/i);
       if (pd) {
-        return this.playable(`https://pixeldrain.com/api/file/${pd[1]}?download`, "mp4", pageUrl);
+        return this.playable(`https://pixeldrain.com/api/file/${pd[1]}?download`, "mp4", base);
       }
     }
     // 4. HubCloud mirror pick (FSLv2 etc.).
     const mirror = this.pickMirror(html, pageUrl);
-    if (mirror) {
-      return this.playable(mirror.url, /\.m3u8/i.test(mirror.url) ? "hls" : "mp4", pageUrl);
+    if (mirror && !this.isArchive(mirror.url)) {
+      return this.playable(mirror.url, this.mediaTypeHint(mirror.url), base);
     }
     // 5. Loose media URL anywhere in the markup.
-    const loose = this.extractMediaUrls(html);
-    if (loose.length) return this.playable(loose[0], "", pageUrl);
+    const loose = this.extractMediaUrls(html).filter((u) => !this.isArchive(u));
+    if (loose.length) return this.playable(loose[0], this.mediaTypeHint(loose[0]), base);
     return null;
   }
 
@@ -550,7 +713,7 @@ export default class extends Extension {
 
   looksLikeFile(url) {
     const value = String(url || "");
-    return /X-Amz-Signature|response-content-disposition|\.r2\.|storage\.googleapis\.com|pixeldrain\.|\/api\/file\/|zdownload\.php|aws[a-z]*stor[a-z]*\d*\.[a-z]+|\.(?:mkv|mp4|webm|m3u8|avi|mov|zip)(?:[?#%&]|\s|"|$)|[?&]download(?:=|&|$)/i.test(
+    return /X-Amz-Signature|response-content-disposition|\.r2\.|storage\.googleapis\.com|pixeldrain\.|\/api\/file\/|zdownload\.php|aws[a-z]*stor[a-z]*\d*\.[a-z]+|\.(?:mkv|mp4|webm|m3u8|avi|mov|zip)(?:[?#%&'"\s]|$)|[?&]download(?:=|&|$)/i.test(
       value
     );
   }
@@ -586,21 +749,54 @@ export default class extends Extension {
   }
 
   playable(streamUrl, typeHint = "", referer = SITE_URL) {
-    const url = this.normaliseUrl(streamUrl);
+    const url = this.encodeMediaUrl(this.normaliseUrl(streamUrl));
     if (!/^https?:\/\//i.test(url)) throw new Error("FilmyFly: invalid stream URL.");
     const isMp4 =
-      /^(mp4|webm|mkv)$/i.test(typeHint) || /\.(?:mp4|webm|mkv)(?:$|[?#%])/i.test(url);
-    const safeReferer = /^https?:\/\//i.test(referer) ? referer : `${SITE_URL}/`;
-    const originMatch = safeReferer.match(/^(https?:\/\/[^/]+)/i);
+      /^(mp4|webm|mkv)$/i.test(typeHint) ||
+      (!/^hls$/i.test(typeHint || "") && /\.(?:mp4|webm|mkv|avi|mov)(?:[?#%&'"\s]|$)/i.test(url));
+    const refSource = /^https?:\/\//i.test(referer) ? referer : `${SITE_URL}/`;
+    const origin = (refSource.match(/^(https?:\/\/[^/]+)/i) || [SITE_URL])[0];
     return {
       type: isMp4 ? "mp4" : "hls",
       url,
       headers: {
         "User-Agent": USER_AGENT,
-        Referer: safeReferer.endsWith("/") ? safeReferer : `${safeReferer}/`,
-        ...(originMatch ? { Origin: originMatch[1] } : {}),
+        Referer: `${origin}/`,
       },
     };
+  }
+
+  // mpv/ffmpeg cannot send raw spaces or control characters in the request
+  // line — the server then answers an HTML error page and the player
+  // reports "failed to recognize file format". Percent-encode the unsafe
+  // characters exactly like a browser would, leaving existing %XX
+  // sequences untouched.
+  encodeMediaUrl(url) {
+    return String(url || "").replace(/[\x00-\x20"<>`\\^{|}\x7f-\uffff]/g, (ch) => encodeURIComponent(ch));
+  }
+
+  mediaTypeHint(url) {
+    return /\.m3u8(?:[?#%&'"\s]|$)/i.test(String(url || "")) ? "hls" : "mp4";
+  }
+
+  isArchive(url) {
+    return /\.(?:zip|rar|7z)(?:[?#%&'"\s]|$)/i.test(String(url || ""));
+  }
+
+  // Origin of the page a link was found on. filesdl hosts redirect
+  // (new1.filesdl.in -> new6.filesdl.top) and their CDN only trusts the
+  // real page host as Referer, so prefer the page's canonical/og URL when
+  // present; fall back to the URL we requested.
+  pageBaseUrl(html, fallbackUrl) {
+    const source = String(html || "");
+    const canon =
+      (source.match(/<link\b[^>]*rel=["']canonical["'][^>]*href=["']([^"']+)["']/i) || [])[1] ||
+      (source.match(/<link\b[^>]*href=["']([^"']+)["'][^>]*rel=["']canonical["']/i) || [])[1] ||
+      (source.match(/<meta\b[^>]*property=["']og:url["'][^>]*content=["']([^"']+)["']/i) || [])[1] ||
+      (source.match(/<meta\b[^>]*content=["'](https?:\/\/[^"']+)["'][^>]*property=["']og:url["']/i) || [])[1];
+    const candidate = canon || String(fallbackUrl || "");
+    const m = String(candidate).match(/^https?:\/\/[^/]+/i);
+    return m ? m[0] : SITE_URL;
   }
 
   // ---------- networking ----------
@@ -633,7 +829,7 @@ export default class extends Extension {
 
     for (let round = 0; round < 2; round += 1) {
       const got = await tryGet(absolute);
-      if (got.body && (this.isBlockedPage(got.body) || got.body.length >= 200)) {
+      if (this.looksLikePayload(got.body)) {
         return got.body;
       }
       reasons.push(got.error || "empty body");
@@ -645,7 +841,7 @@ export default class extends Extension {
 
     for (const relay of relayUrls) {
       const got = await tryGet(relay);
-      if (got.body && !/error code 5\d\d|connection timed out|rate limit exceeded|temporarily rate limited/i.test(got.body) && got.body.length >= 200) {
+      if (got.body && !/error code 5\d\d|connection timed out|rate limit exceeded|temporarily rate limited/i.test(got.body) && this.looksLikePayload(got.body)) {
         return got.body;
       }
       reasons.push(got.error || "relay empty");
@@ -654,6 +850,16 @@ export default class extends Extension {
 
     this._lastError = firstError || reasons.find(Boolean) || "";
     return "";
+  }
+
+  // Junk/error stubs (proxy failure pages, empty bodies) are rejected, but
+  // so once were legitimately tiny XML sitemaps — accept those.
+  looksLikePayload(body) {
+    const source = String(body || "");
+    if (!source) return false;
+    if (this.isBlockedPage(source)) return true;
+    if (source.length >= 200) return true;
+    return /^\s*(?:<\?xml|<sitemapindex|<urlset)/i.test(source);
   }
 
   async text(promise) {
