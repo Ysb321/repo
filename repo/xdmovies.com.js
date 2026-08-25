@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         XDMovies
-// @version      v0.0.6
+// @version      v0.0.7
 // @author       Ysb321
 // @lang         hi
 // @license      MIT
@@ -48,6 +48,33 @@ export default class extends Extension {
         type: "input",
         defaultValue: "",
       });
+      this.registerSetting({
+        title:
+          "Browser cookie for top.xdmovies.wtf (in your browser: F12 console, run document.cookie, paste result here)",
+        key: "xdmovies_cookie",
+        type: "input",
+        defaultValue: "",
+      });
+      this.registerSetting({
+        title:
+          "User-Agent of that same browser (search 'my user agent' in the browser and paste it)",
+        key: "xdmovies_ua",
+        type: "input",
+        defaultValue: "",
+      });
+      this.registerSetting({
+        title: "scrape.do token (optional anti-bot relay, free tier: scrape.do)",
+        key: "xdmovies_scrapedo_token",
+        type: "input",
+        defaultValue: "",
+      });
+      this.registerSetting({
+        title:
+          "Pasted short link (last resort: copy a link.xdmovies… button link from your browser, then open any title here)",
+        key: "xdmovies_manual_link",
+        type: "input",
+        defaultValue: "",
+      });
     } catch (_) {
       /* older Miru builds without settings support */
     }
@@ -62,9 +89,13 @@ export default class extends Extension {
     }
   }
 
+  // Loads user settings every time a browsing action starts so edits take
+  // effect immediately.
   async ensureToken() {
-    if (this._token !== undefined) return;
     this._token = (await this.getSettingSafe("xdmovies_api_token")) || DEFAULT_API_TOKEN;
+    this._manualCookie = await this.getSettingSafe("xdmovies_cookie");
+    this._manualUA = await this.getSettingSafe("xdmovies_ua");
+    this._scrapeToken = await this.getSettingSafe("xdmovies_scrapedo_token");
   }
 
   // Header set for a request: full browser headers everywhere, plus the
@@ -78,7 +109,13 @@ export default class extends Extension {
       headers["x-requested-with"] = "XMLHttpRequest";
       headers["x-auth-token"] = this._token || DEFAULT_API_TOKEN;
       if (!extra.Referer) headers.Referer = `${API_URL}/`;
-      if (this._cfCookies) {
+      // A cookie the user copied out of their own browser beats everything
+      // (it is exactly what the path rule wants to see); next, clearance
+      // cookies captured by a solver.
+      if (this._manualCookie) {
+        headers.Cookie = this._manualCookie;
+        if (this._manualUA) headers["User-Agent"] = this._manualUA;
+      } else if (this._cfCookies) {
         headers.Cookie = this._cfCookies;
         if (this._cfUA) headers["User-Agent"] = this._cfUA;
       }
@@ -182,13 +219,18 @@ export default class extends Extension {
   async detail(url) {
     await this.ensureToken();
     const path = this.toPath(url);
+    const manualLink = this.extractHttpUrl(
+      await this.getSettingSafe("xdmovies_manual_link")
+    );
     const html = await this.getPage(path);
     if (this.isBlockedPage(html)) {
+      if (manualLink) return this.manualDetail(manualLink);
       throw new Error(
         "XDMovies: Cloudflare is verifying this request. Open the site once in your browser, then retry."
       );
     }
     if (!html || html.length < 1200) {
+      if (manualLink) return this.manualDetail(manualLink);
       const why = this._lastError ? ` (${this._lastError})` : "";
       throw new Error(
         `XDMovies: the title page request failed${why}. The site may be blocking Miru's requests — retry, try a VPN, and report this exact message.`
@@ -248,13 +290,46 @@ export default class extends Extension {
       if (channel.urls.length) episodes.push(channel);
     }
 
+    // A short link pasted into the settings always shows up as its own
+    // channel (works even when the rest of the page didn't load).
+    if (manualLink) {
+      episodes.unshift(this.manualChannel(manualLink));
+    }
+
     if (!episodes.length) {
+      if (manualLink) return this.manualDetail(manualLink);
       throw new Error(
         "XDMovies: no watch/download links found on this page. The site may build them with a script Miru can't run — please report this title."
       );
     }
 
     return { title, cover, desc, episodes };
+  }
+
+  extractHttpUrl(text) {
+    const match = String(text || "").match(/https?:\/\/[^\s"'<>]+/i);
+    return match ? this.normaliseUrl(match[0]) : "";
+  }
+
+  manualChannel(link) {
+    return {
+      title: "Manual Link (pasted)",
+      urls: [
+        {
+          name: "Play pasted link",
+          url: `xd:file:${encodeURIComponent(link)}`,
+        },
+      ],
+    };
+  }
+
+  manualDetail(link) {
+    return {
+      title: "XDMovies — pasted link",
+      cover: "",
+      desc: "Playing the short link pasted in the extension settings. Clear that setting to browse normally.",
+      episodes: [this.manualChannel(link)],
+    };
   }
 
   async watch(url) {
@@ -979,7 +1054,25 @@ export default class extends Extension {
       }
     }
 
-    // Pass 3: relays (their servers fetch the page, not the local client).
+    // Pass 3: optional scrape.do anti-bot relay (user-provided token;
+    // render=true runs it through their headless browser).
+    if (this._scrapeToken) {
+      const scrape = `https://api.scrape.do/?token=${encodeURIComponent(
+        this._scrapeToken
+      )}&url=${encodeURIComponent(relayBase)}&render=true`;
+      const got = await tryGet(scrape);
+      if (
+        got.body &&
+        !this.isRelayJunk(got.body) &&
+        !this.isDenyStub(got.body) &&
+        got.body.length >= 200
+      ) {
+        return got.body;
+      }
+      note(got);
+    }
+
+    // Pass 4: public relays (their servers fetch the page, not the local client).
     for (const relay of relayUrls) {
       const extra = relay.includes("corsfix") ? { Origin: "https://miru.local" } : {};
       const got = await tryGet(relay, extra);
