@@ -1874,7 +1874,20 @@
   "version": "v0.1.1",
   "webSite": "https://dick.xfani.com"
  },
- {
+  {
+  "author": "Ysb321",
+  "icon": "https://top.xdmovies.wtf/favicon.ico",
+  "lang": "hi",
+  "license": "MIT",
+  "name": "XDMovies",
+  "nsfw": "false",
+  "package": "xdmovies.com",
+  "type": "bangumi",
+  "url": "xdmovies.com.js",
+  "version": "v0.0.1",
+  "webSite": "https://top.xdmovies.wtf"
+ },
+{
   "author": "bachig26",
   "icon": "https://static-lvlt.xhcdn.com/xh-desktop/images/favicon/favicon-512x512.png?v=1",
   "lang": "en",
