@@ -106,6 +106,14 @@ export default class extends Extension {
 
   async watch(url) {
     const packed = String(url || "");
+
+    // A page marker is used when the site exposes a player iframe instead of
+    // putting the stream URL directly in the document.
+    const pageMatch = packed.match(/^hdghartv:page:(.+)$/i);
+    if (pageMatch) {
+      return this.resolvePlayerPage(this.decodeURIComponentSafe(pageMatch[1]));
+    }
+
     let type = "";
     let streamUrl = packed;
     let audioTrack = "";
@@ -139,13 +147,51 @@ export default class extends Extension {
     return result;
   }
 
-  async sitePage(url) {
+  async resolvePlayerPage(url) {
+    let currentUrl = this.resolveUrl(url);
+    let referer = SITE_URL;
+    const seen = new Set();
+
+    for (let attempt = 0; attempt < 4 && currentUrl; attempt += 1) {
+      if (seen.has(currentUrl)) break;
+      seen.add(currentUrl);
+
+      const html = await this.fetchHtml(currentUrl, referer);
+      const media = this.extractMediaUrls(html).filter((candidate) =>
+        this.isWorkingQuality(candidate)
+      );
+      if (media.length) {
+        const mediaUrl = media[0];
+        const isMp4 = /\\.(?:mp4|webm)(?:$|[?#])/i.test(mediaUrl);
+        return {
+          type: isMp4 ? "mp4" : "hls",
+          url: mediaUrl,
+          headers: {
+            "User-Agent": USER_AGENT,
+            Referer: currentUrl,
+            Origin: SITE_URL,
+          },
+        };
+      }
+
+      const next = this.extractPlayerUrls(html, currentUrl).find(
+        (candidate) => !seen.has(candidate)
+      );
+      if (!next) break;
+      referer = currentUrl;
+      currentUrl = next;
+    }
+
+    throw new Error("HDGharTV: no playable stream was found on the player page.");
+  }
+
+  async fetchHtml(url, referer = SITE_URL) {
     try {
       const response = await this.request("", {
         headers: {
           "Miru-Url": this.resolveUrl(url),
           Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          Referer: `${SITE_URL}/`,
+          Referer: referer || `${SITE_URL}/`,
           "User-Agent": USER_AGENT,
         },
       });
@@ -153,6 +199,10 @@ export default class extends Extension {
     } catch (_) {
       return "";
     }
+  }
+
+  async sitePage(url) {
+    return this.fetchHtml(this.resolveUrl(url), SITE_URL);
   }
 
   scrapeCatalog(html) {
@@ -227,7 +277,27 @@ export default class extends Extension {
     const mediaUrls = this.extractMediaUrls(source).filter((url) =>
       this.isWorkingQuality(url)
     );
-    if (!mediaUrls.length) return null;
+    if (mediaUrls.length) {
+      return {
+        title,
+        cover,
+        desc,
+        episodes: [
+          {
+            title: "HDGharTV",
+            urls: mediaUrls.map((mediaUrl, index) => ({
+              name: this.mediaQuality(mediaUrl) || `Server ${index + 1}`,
+              url: this.packSource({ url: mediaUrl }),
+            })),
+          },
+        ],
+      };
+    }
+
+    const playerUrls = this.extractPlayerUrls(source, pageUrl).filter(
+      (playerUrl) => !/youtube|youtu\.be|premium|facebook|twitter|telegram/i.test(playerUrl)
+    );
+    if (!playerUrls.length) return null;
 
     return {
       title,
@@ -236,9 +306,9 @@ export default class extends Extension {
       episodes: [
         {
           title: "HDGharTV",
-          urls: mediaUrls.map((mediaUrl, index) => ({
-            name: this.mediaQuality(mediaUrl) || `Server ${index + 1}`,
-            url: this.packSource({ url: mediaUrl }),
+          urls: playerUrls.map((playerUrl, index) => ({
+            name: `Server ${index + 1}`,
+            url: this.packPage(playerUrl),
           })),
         },
       ],
@@ -267,6 +337,35 @@ export default class extends Extension {
     let match;
     while ((match = urlRegex.exec(source)) !== null) add(match[0]);
     return urls;
+  }
+
+  extractPlayerUrls(value, baseUrl = SITE_URL) {
+    const source = this.asText(value).replace(/\\\//g, "/");
+    const urls = [];
+    const seen = new Set();
+    const add = (candidate) => {
+      const url = this.resolveUrl(candidate, baseUrl);
+      if (
+        !url ||
+        seen.has(url) ||
+        !/^https?:\/\//i.test(url) ||
+        /youtube|youtu\.be|premium|facebook|twitter|telegram/i.test(url)
+      ) {
+        return;
+      }
+      seen.add(url);
+      urls.push(url);
+    };
+
+    const tagRegex =
+      /<(?:iframe|video|source)\b[^>]+(?:src|data-src|data-url|data-video)=["']([^"']+)["'][^>]*>/gi;
+    let match;
+    while ((match = tagRegex.exec(source)) !== null) add(match[1]);
+    return urls;
+  }
+
+  packPage(url) {
+    return `hdghartv:page:${encodeURIComponent(url)}`;
   }
 
   mediaQuality(url) {
@@ -440,7 +539,7 @@ export default class extends Extension {
       // At the moment HDGharTV's 480p/720p CDN entries are not playable.
       // Keep them out of the Miru catalogue instead of presenting a link
       // that will only fail after the user selects it.
-      if (!this.isWorkingQuality(link.quality)) continue;
+      if (!this.isWorkingQuality(`${link.quality || ""} ${link.url}`)) continue;
 
       const hls = this.isHlsLink(link);
       const playlist = hls ? await this.fetchPlaylist(link.url) : "";
@@ -468,17 +567,24 @@ export default class extends Extension {
 
   activeLinks(links) {
     if (!Array.isArray(links)) return [];
-    return links.filter(
-      (link) => link && link.url && link.isActive !== false
-    );
+    return links
+      .map((link) => {
+        if (!link || typeof link !== "object") return null;
+        return {
+          ...link,
+          url: link.url || link.file || link.src || link.streamUrl || "",
+          type: link.type || link.format || "hls",
+        };
+      })
+      .filter((link) => link && link.url && link.isActive !== false);
   }
 
   isWorkingQuality(quality) {
     const value = String(quality || "");
-    // Keep broken lower-quality records out. Direct HLS URLs from the site
-    // often do not contain a resolution, so allow the known stream CDN too.
-    if (/(?:2160|1440|720|480|360|4k)/i.test(value)) return false;
-    return /1080|streamraiwind/i.test(value);
+    // The current lower-quality CDN records are stale. Reject only explicit
+    // lower-quality values; direct master URLs often have no resolution in
+    // their path, so those are allowed instead of accidentally hiding 1080p.
+    return !/(?:2160|1440|720|480|360|4k)/i.test(value);
   }
 
   isHlsLink(link) {
